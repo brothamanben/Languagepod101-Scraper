@@ -1,0 +1,695 @@
+import os
+import re
+import html
+import time
+import pandas as pd
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+
+
+# ============================================================
+# SETUP
+# ============================================================
+
+LANGUAGE = input("Language, e.g. Korean, Japanese, Thai, Russian, Spanish, Chinese: ").strip()
+LIBRARY_URL = input("Paste main lesson library URL: ").strip()
+
+language_safe = re.sub(r"[^a-zA-Z0-9]+", "_", LANGUAGE).strip("_").lower()
+
+OUTPUT_ROOT = f"{language_safe}_pod101_LIBRARY_DOWNLOAD"
+PROFILE_DIR = f"{language_safe}_pod101_profile"
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def clean(text):
+    if not text:
+        return ""
+    text = html.unescape(str(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def safe_filename(text, max_len=70):
+    text = clean(text)
+    text = re.sub(r'[<>:"/\\|?*]+', "", text)
+    text = text.replace("'", "").replace("’", "")
+    text = text.replace("...", "").replace("…", "")
+    text = re.sub(
+        r"[^\w가-힣ぁ-んァ-ン一-龯а-яА-ЯёЁà-ỹÀ-Ỹ]+",
+        "_",
+        text,
+        flags=re.UNICODE
+    )
+    text = text.strip("._- ")
+    text = text.rstrip(". ")
+    return text[:max_len].rstrip(". ") or "item"
+
+
+def ensure_parent_folder(path):
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+
+def get_audio_url(tag):
+    return (
+        tag.get("data-src")
+        or tag.get("data-audio")
+        or tag.get("data-url")
+        or tag.get("src")
+    )
+
+
+def is_audio(url):
+    return url and "learningcenter/audio" in url and url.lower().endswith((".mp3", ".m4a"))
+
+
+def get_title(soup):
+    h1 = soup.find("h1")
+    if h1:
+        title = clean(h1.get_text(" ", strip=True))
+        if title and title.lower() != "lesson library":
+            return title
+
+    title_tag = soup.find("title")
+    if title_tag:
+        title = clean(title_tag.get_text())
+        title = re.sub(r"\s*-\s*.*101.*$", "", title)
+        return title or "lesson"
+
+    return "lesson"
+
+
+def download(context, url, path):
+    try:
+        ensure_parent_folder(path)
+
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            print("⏭️ Existing audio:", os.path.basename(path))
+            return True
+
+        response = context.request.get(url)
+
+        if response.status != 200:
+            print("❌ Failed:", url, "Status:", response.status)
+            return False
+
+        with open(path, "wb") as f:
+            f.write(response.body())
+
+        print("✅", os.path.basename(path))
+        return True
+
+    except Exception as e:
+        print(f"❌ Error saving {path}: {e}")
+        return False
+
+
+def scroll_page(page, rounds=20):
+    for _ in range(rounds):
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1200)
+        except:
+            page.wait_for_timeout(2000)
+
+
+def lesson_already_done(group_dir, lesson_number):
+    lesson_folder = os.path.join(group_dir, f"{lesson_number:03d}")
+
+    if not os.path.exists(lesson_folder):
+        return False
+
+    for file in os.listdir(lesson_folder):
+        file_path = os.path.join(lesson_folder, file)
+
+        if file.endswith("_anki.csv") and os.path.getsize(file_path) > 0:
+            return True
+
+    return False
+
+
+def same_domain(url1, url2):
+    return urlparse(url1).netloc == urlparse(url2).netloc
+
+
+# ============================================================
+# COLLECT LEVEL / GROUP PAGES
+# ============================================================
+
+def collect_library_groups(page, library_url):
+    """
+    Finds:
+    1. Level pages from the level dropdown:
+       /lesson-library/absolute-beginner
+       /lesson-library/beginner
+       /lesson-library/intermediate
+       etc.
+
+    2. Group/pathway pages on each level:
+       /lesson-library/making-an-appointment-in-korean
+       /lesson-library/level-2-1-group-lesson-week-3
+       etc.
+    """
+
+    page.goto(library_url, wait_until="networkidle", timeout=90000)
+    page.wait_for_timeout(4000)
+    scroll_page(page)
+
+    soup = BeautifulSoup(page.content(), "html.parser")
+
+    level_urls = []
+    seen_levels = set()
+
+    def add_level(raw):
+        if not raw:
+            return
+
+        full = urljoin(library_url, html.unescape(raw).replace("&amp;", "&"))
+        parsed = urlparse(full)
+
+        if not same_domain(full, library_url):
+            return
+
+        if not parsed.path.startswith("/lesson-library/"):
+            return
+
+        slug = parsed.path.rstrip("/").split("/")[-1]
+
+        allowed_level_slugs = {
+            "absolute-beginner",
+            "beginner",
+            "intermediate",
+            "upper-intermediate",
+            "advanced",
+            "bonus"
+        }
+
+        if slug not in allowed_level_slugs:
+            return
+
+        full = full.split("#")[0].split("?")[0]
+
+        if full not in seen_levels:
+            seen_levels.add(full)
+            level_urls.append(full)
+
+    for a in soup.select("a[href]"):
+        classes = " ".join(a.get("class", []))
+        text = clean(a.get_text(" ", strip=True))
+
+        if "r101-dropdown_level" in classes or text in {
+            "Absolute Beginner",
+            "Beginner",
+            "Intermediate",
+            "Upper Intermediate",
+            "Advanced",
+            "Bonus"
+        }:
+            add_level(a.get("href"))
+
+    if not level_urls:
+        level_urls = [library_url]
+
+    print("\nDetected level pages:")
+    for i, url in enumerate(level_urls, 1):
+        print(f"{i}. {url}")
+
+    all_groups = []
+    seen_groups = set()
+
+    for level_url in level_urls:
+        print("\nScanning level page:", level_url)
+
+        page.goto(level_url, wait_until="networkidle", timeout=90000)
+        page.wait_for_timeout(4000)
+        scroll_page(page)
+
+        soup = BeautifulSoup(page.content(), "html.parser")
+
+        level_slug = urlparse(level_url).path.rstrip("/").split("/")[-1]
+        level_name = level_slug.replace("-", " ").title()
+
+        for a in soup.select("a[href]"):
+            href = a.get("href")
+            full = urljoin(level_url, html.unescape(href or "").replace("&amp;", "&"))
+            parsed = urlparse(full)
+
+            if not same_domain(full, library_url):
+                continue
+
+            if not parsed.path.startswith("/lesson-library/"):
+                continue
+
+            if parsed.path.rstrip("/") == urlparse(level_url).path.rstrip("/"):
+                continue
+
+            if "/lesson/" in parsed.path:
+                continue
+
+            classes = " ".join(a.get("class", []))
+
+            if "ll-collection-all" not in classes:
+                continue
+
+            group_title = clean(a.get_text(" ", strip=True))
+
+            group_title = re.sub(r"\b\d+\s+Lessons?\b", "", group_title, flags=re.I)
+            group_title = re.sub(r"\b\d+\s+Assessments?\b", "", group_title, flags=re.I)
+            group_title = re.sub(r"\bBeginner\b|\bIntermediate\b|\bAdvanced\b|\bBonus\b|\bAbsolute Beginner\b|\bUpper Intermediate\b", "", group_title, flags=re.I)
+            group_title = clean(group_title)
+
+            if not group_title:
+                group_title = parsed.path.rstrip("/").split("/")[-1].replace("-", " ").title()
+
+            full = full.split("#")[0]
+
+            key = full
+            if key in seen_groups:
+                continue
+
+            seen_groups.add(key)
+
+            all_groups.append({
+                "level_name": level_name,
+                "group_name": group_title,
+                "url": full
+            })
+
+    if not all_groups:
+        print("\nNo group/pathway pages found. Using the pasted page directly.")
+        all_groups.append({
+            "level_name": "Library",
+            "group_name": "Main Library",
+            "url": library_url
+        })
+
+    print("\nDetected downloadable groups/pathways:")
+    for i, group in enumerate(all_groups, 1):
+        print(f"{i:03d}. [{group['level_name']}] {group['group_name']} - {group['url']}")
+
+    return all_groups
+
+
+# ============================================================
+# COLLECT LESSON LINKS INSIDE GROUP
+# ============================================================
+
+def collect_lesson_links(page, group_url):
+    page.goto(group_url, wait_until="networkidle", timeout=90000)
+    page.wait_for_timeout(4000)
+    scroll_page(page)
+
+    page_html = page.content()
+    soup = BeautifulSoup(page_html, "html.parser")
+
+    links = []
+    seen = set()
+
+    def add_link(raw):
+        if not raw:
+            return
+
+        raw = html.unescape(raw).replace("\\/", "/").replace("&amp;", "&")
+        full_url = urljoin(group_url, raw)
+        parsed = urlparse(full_url)
+
+        if "/lesson/" not in parsed.path:
+            return
+
+        full_url = full_url.split("#")[0]
+
+        if full_url not in seen:
+            seen.add(full_url)
+            links.append(full_url)
+
+    for a in soup.select("a[href]"):
+        add_link(a.get("href"))
+
+    patterns = [
+        r'"url"\s*:\s*"([^"]*?/lesson/[^"]+)"',
+        r"&quot;url&quot;\s*:\s*&quot;([^&]+?/lesson/[^&]+)&quot;",
+        r"(\/lesson\/[^\"'<>\s]+?\?lp=\d+)",
+        r"(https?://[^\"'<>\s]+?/lesson/[^\"'<>\s]+?\?lp=\d+)",
+        r"(\/lesson\/[^\"'<>\s]+)",
+        r"(https?://[^\"'<>\s]+?/lesson/[^\"'<>\s]+)"
+    ]
+
+    for pattern in patterns:
+        for match in re.findall(pattern, page_html):
+            add_link(match)
+
+    return links
+
+
+# ============================================================
+# SCRAPE ONE LESSON
+# ============================================================
+
+def scrape_lesson(context, page, lesson_url, lesson_number, level_name, group_name, group_safe, group_dir):
+    print("\n" + "=" * 80)
+    print(f"{level_name} / {group_name} - Lesson {lesson_number:03d}")
+    print(lesson_url)
+
+    page.goto(lesson_url, wait_until="networkidle", timeout=90000)
+    page.wait_for_timeout(4000)
+
+    soup = BeautifulSoup(page.content(), "html.parser")
+
+    title = get_title(soup)
+    slug = safe_filename(title).lower()
+
+    lesson_folder = os.path.join(group_dir, f"{lesson_number:03d}")
+    os.makedirs(lesson_folder, exist_ok=True)
+
+    lesson_meta = f"{LANGUAGE} - {level_name} - {group_name} - {lesson_number:03d} - {title}"
+
+    rows = []
+    seen_audio = set()
+
+    # -------------------------
+    # Dialogue lines
+    # -------------------------
+
+    dialogue_count = 0
+
+    for tr in soup.select("tr"):
+        btn = tr.select_one(".js-lsn3-play-dialogue[data-src], .js-lsn3-play-dialogue")
+
+        if not btn:
+            continue
+
+        url = get_audio_url(btn)
+
+        if not is_audio(url) or url in seen_audio:
+            continue
+
+        speaker_tag = tr.select_one(
+            ".lsn3-lesson-dialogue__td--name, "
+            "[class*='dialogue__td--name'], "
+            "[class*='dialogue'][class*='name']"
+        )
+
+        text_tag = tr.select_one(
+            ".lsn3-lesson-dialogue__td--text, "
+            "[class*='dialogue__td--text'], "
+            "[class*='dialogue'][class*='text']"
+        )
+
+        speaker = clean(speaker_tag.get_text(" ", strip=True)) if speaker_tag else ""
+        text = clean(text_tag.get_text(" ", strip=True)) if text_tag else clean(btn.get("data-text"))
+
+        if speaker and text and not text.startswith(speaker):
+            front = f"{speaker} {text}"
+        else:
+            front = text
+
+        back = clean(btn.get("data-english-text"))
+
+        seen_audio.add(url)
+        dialogue_count += 1
+
+        filename = f"{language_safe}_{group_safe}_{lesson_number:03d}_{slug}_dlg_{dialogue_count:02d}.mp3"
+        filename = safe_filename(filename.replace(".mp3", ""), max_len=100) + ".mp3"
+        path = os.path.join(lesson_folder, filename)
+
+        if download(context, url, path):
+            rows.append({
+                "Type": f"{lesson_meta} (Dialogue Line)",
+                "Front": front,
+                "Back": back,
+                "Audio": f"[sound:{filename}]"
+            })
+
+    # -------------------------
+    # Vocabulary words
+    # -------------------------
+
+    vocab_count = 0
+
+    vocab_rows = soup.select(
+        "tr:has(.lsn3-lesson-vocabulary__lang), "
+        "tr:has(.lesson-vocabulary__lang), "
+        "tr:has([class*='vocabulary__lang'])"
+    )
+
+    for tr in vocab_rows:
+        classes = " ".join(tr.get("class", []))
+
+        if "sample" in classes.lower() or "example" in classes.lower():
+            continue
+
+        word_tag = tr.select_one(
+            ".lsn3-lesson-vocabulary__lang, "
+            ".lesson-vocabulary__lang, "
+            "[class*='vocabulary__lang']"
+        )
+
+        meaning_tag = tr.select_one(
+            ".lsn3-lesson-vocabulary__definition, "
+            ".lesson-vocabulary__definition, "
+            "[class*='definition'], "
+            "[class*='meaning']"
+        )
+
+        btn = tr.select_one(".js-lsn3-play-vocabulary[data-src], .js-lsn3-play-vocabulary")
+
+        if not word_tag or not btn:
+            continue
+
+        url = get_audio_url(btn)
+
+        if not is_audio(url) or url in seen_audio:
+            continue
+
+        word = clean(word_tag.get_text(" ", strip=True))
+        meaning = clean(meaning_tag.get_text(" ", strip=True)) if meaning_tag else clean(btn.get("data-english-text"))
+
+        if not word:
+            continue
+
+        seen_audio.add(url)
+        vocab_count += 1
+
+        filename = f"{language_safe}_{group_safe}_{lesson_number:03d}_{slug}_vocab_{vocab_count:02d}.mp3"
+        filename = safe_filename(filename.replace(".mp3", ""), max_len=100) + ".mp3"
+        path = os.path.join(lesson_folder, filename)
+
+        if download(context, url, path):
+            rows.append({
+                "Type": f"{lesson_meta} (Vocabulary)",
+                "Front": word,
+                "Back": meaning,
+                "Audio": f"[sound:{filename}]"
+            })
+
+    # -------------------------
+    # Vocab sample sentences
+    # -------------------------
+
+    sentence_count = 0
+
+    sample_blocks = soup.select(
+        "tr:has(.js-lsn3-play-vocabulary[data-src]), "
+        "div:has(.js-lsn3-play-vocabulary[data-src]), "
+        "li:has(.js-lsn3-play-vocabulary[data-src])"
+    )
+
+    for block in sample_blocks:
+        block_text = clean(block.get_text(" ", strip=True))
+
+        if not block_text:
+            continue
+
+        lower_text = block_text.lower()
+
+        likely_sentence = (
+            "sample" in lower_text
+            or "example" in lower_text
+            or len(block_text) > 35
+        )
+
+        if not likely_sentence:
+            continue
+
+        btn = block.select_one(".js-lsn3-play-vocabulary[data-src], .js-lsn3-play-vocabulary")
+
+        if not btn:
+            continue
+
+        url = get_audio_url(btn)
+
+        if not is_audio(url) or url in seen_audio:
+            continue
+
+        text = clean(btn.get("data-text")) or block_text
+        back = clean(btn.get("data-english-text"))
+
+        if not text:
+            continue
+
+        seen_audio.add(url)
+        sentence_count += 1
+
+        filename = f"{language_safe}_{group_safe}_{lesson_number:03d}_{slug}_vs_{sentence_count:02d}.mp3"
+        filename = safe_filename(filename.replace(".mp3", ""), max_len=100) + ".mp3"
+        path = os.path.join(lesson_folder, filename)
+
+        if download(context, url, path):
+            rows.append({
+                "Type": f"{lesson_meta} (Vocab Sentence)",
+                "Front": text,
+                "Back": back,
+                "Audio": f"[sound:{filename}]"
+            })
+
+    # -------------------------
+    # Write lesson CSV
+    # -------------------------
+
+    csv_filename = f"{language_safe}_{group_safe}_{lesson_number:03d}_{slug}_anki.csv"
+    csv_filename = safe_filename(csv_filename.replace(".csv", ""), max_len=100) + ".csv"
+    csv_path = os.path.join(lesson_folder, csv_filename)
+
+    df = pd.DataFrame(rows, columns=["Type", "Front", "Back", "Audio"])
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    print("Dialogue:", dialogue_count)
+    print("Vocab words:", vocab_count)
+    print("Vocab sentences:", sentence_count)
+    print("Total cards:", len(rows))
+    print("CSV:", csv_path)
+
+    return rows
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+with sync_playwright() as p:
+    context = p.chromium.launch_persistent_context(
+        user_data_dir=PROFILE_DIR,
+        headless=False
+    )
+
+    page = context.new_page()
+
+    print("\n👉 Browser opened.")
+    print("👉 Log in if needed.")
+    print("👉 Go through Cloudflare/cookies if they appear.")
+    input("Press ENTER after the page is ready...")
+
+    groups = collect_library_groups(page, LIBRARY_URL)
+
+    print("\nTotal groups found:", len(groups))
+    confirm = input("\nType YES to download all detected groups: ").strip().upper()
+
+    if confirm != "YES":
+        print("Canceled.")
+        context.close()
+        raise SystemExit
+
+    all_rows = []
+    total_skipped = 0
+
+    for group_index, group in enumerate(groups, 1):
+        level_name = group["level_name"]
+        group_name = group["group_name"]
+        group_url = group["url"]
+
+        level_safe = safe_filename(level_name, max_len=40).lower()
+        group_safe = safe_filename(group_name, max_len=60).lower()
+
+        group_dir = os.path.join(
+            OUTPUT_ROOT,
+            level_safe,
+            group_safe
+        )
+
+        os.makedirs(group_dir, exist_ok=True)
+
+        print("\n" + "#" * 90)
+        print(f"GROUP {group_index}/{len(groups)}")
+        print("Level:", level_name)
+        print("Group:", group_name)
+        print("Folder:", group_dir)
+        print("URL:", group_url)
+        print("#" * 90)
+
+        lesson_links = collect_lesson_links(page, group_url)
+
+        if not lesson_links:
+            print("\nNo lesson links found in this group. Skipping.")
+            continue
+
+        print(f"\nFound {len(lesson_links)} lessons:")
+        for i, link in enumerate(lesson_links, 1):
+            print(f"{i:03d}. {link}")
+
+        group_rows = []
+        skipped_in_group = 0
+
+        for lesson_number, lesson_link in enumerate(lesson_links, 1):
+            if lesson_already_done(group_dir, lesson_number):
+                print(f"\n⏭️ Skipping lesson {lesson_number:03d}; CSV already exists.")
+                skipped_in_group += 1
+                total_skipped += 1
+                continue
+
+            rows = scrape_lesson(
+                context=context,
+                page=page,
+                lesson_url=lesson_link,
+                lesson_number=lesson_number,
+                level_name=level_name,
+                group_name=group_name,
+                group_safe=group_safe,
+                group_dir=group_dir
+            )
+
+            group_rows.extend(rows)
+            all_rows.extend(rows)
+
+            if lesson_number < len(lesson_links):
+                print("\nResting 15 seconds before next lesson.\n")
+                time.sleep(15)
+
+        group_master_csv = os.path.join(
+            group_dir,
+            safe_filename(f"{language_safe}_{level_safe}_{group_safe}_MASTER_anki", max_len=100) + ".csv"
+        )
+
+        df_group = pd.DataFrame(group_rows, columns=["Type", "Front", "Back", "Audio"])
+        df_group.to_csv(group_master_csv, index=False, encoding="utf-8-sig")
+
+        print("\nDONE WITH GROUP")
+        print("Group CSV:", group_master_csv)
+        print("New cards in group:", len(group_rows))
+        print("Skipped lessons in group:", skipped_in_group)
+
+        if group_index < len(groups):
+            print("\nResting 25 seconds before next group.\n")
+            time.sleep(25)
+
+    context.close()
+
+
+all_master_csv = os.path.join(
+    OUTPUT_ROOT,
+    safe_filename(f"{language_safe}_ALL_GROUPS_MASTER_anki", max_len=100) + ".csv"
+)
+
+df_all = pd.DataFrame(all_rows, columns=["Type", "Front", "Back", "Audio"])
+df_all.to_csv(all_master_csv, index=False, encoding="utf-8-sig")
+
+print("\nALL DONE")
+print("Output folder:", OUTPUT_ROOT)
+print("Combined master CSV:", all_master_csv)
+print("Total new cards this run:", len(all_rows))
+print("Total skipped lessons:", total_skipped)
