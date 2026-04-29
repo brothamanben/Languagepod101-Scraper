@@ -1,7 +1,9 @@
-import os
+﻿import os
 import re
 import html
 import time
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -29,7 +31,7 @@ while True:
     level_name = input("Level name, e.g. L1, L2, L3, Beginner: ").strip()
 
     if not level_name:
-        print("❌ Level name cannot be blank.")
+        print("Level name cannot be blank.")
         continue
 
     level_safe = re.sub(r"[^a-zA-Z0-9]+", "_", level_name).strip("_").lower()
@@ -66,14 +68,13 @@ def clean(text):
 def safe_filename(text, max_len=45):
     text = clean(text)
     text = re.sub(r'[<>:"/\\|?*]+', "", text)
-    text = text.replace("'", "").replace("’", "")
-    text = text.replace("...", "").replace("…", "")
-    text = re.sub(
-        r"[^\w가-힣ぁ-んァ-ン一-龯а-яА-ЯёЁà-ỹÀ-Ỹ]+",
-        "_",
-        text,
-        flags=re.UNICODE
-    )
+    text = text.replace("'", "")
+    text = text.replace("’", "")
+    text = text.replace("...", "")
+    text = text.replace("…", "")
+    text = re.sub(r"[\s-]+", "_", text, flags=re.UNICODE)
+    text = re.sub(r"[^\w.]", "_", text, flags=re.UNICODE)
+    text = re.sub(r"_+", "_", text)
     text = text.strip("._- ")
     text = text.rstrip(". ")
     return text[:max_len].rstrip(". ") or "item"
@@ -126,23 +127,23 @@ def download(context, url, path):
         ensure_parent_folder(path)
 
         if os.path.exists(path) and os.path.getsize(path) > 0:
-            print("⏭️ Existing audio:", os.path.basename(path))
+            print("Existing audio:", os.path.basename(path))
             return True
 
         r = context.request.get(url)
 
         if r.status != 200:
-            print("❌ Failed:", url)
+            print("Failed:", url)
             return False
 
         with open(path, "wb") as f:
             f.write(r.body())
 
-        print("✅", os.path.basename(path))
+        print("Saved:", os.path.basename(path))
         return True
 
     except Exception as e:
-        print(f"❌ Error saving {path}: {e}")
+        print(f"Error saving {path}: {e}")
         return False
 
 
@@ -151,7 +152,7 @@ def scroll_page(page):
         try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1500)
-        except:
+        except Exception:
             page.wait_for_timeout(3000)
 
 
@@ -374,106 +375,167 @@ def scrape_lesson(context, page, lesson_url, lesson_number, level_name, level_sa
     return rows
 
 
-with sync_playwright() as p:
-    context = p.chromium.launch_persistent_context(
-        user_data_dir="pod101_profile",
-        headless=False
-    )
+BASE_PROFILE_DIR = os.path.abspath("pod101_profile")
+WORKER_PROFILE_ROOT = os.path.abspath("pod101_worker_profiles")
 
-    page = context.new_page()
 
-    print("\n👉 Browser opened.")
-    print("👉 Log in if needed on the first page.")
-    print("👉 The script will process each queued level one by one.\n")
+def prepare_base_profile(first_level_url):
+    os.makedirs(WORKER_PROFILE_ROOT, exist_ok=True)
 
-    grand_all_rows = []
-    grand_total_new_cards = 0
-    grand_total_skipped = 0
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=BASE_PROFILE_DIR,
+            headless=False
+        )
+        page = context.new_page()
 
-    for job_index, job in enumerate(LEVEL_JOBS, 1):
-        level_url = job["url"]
-        level_name = job["level"]
-        level_safe = job["level_safe"]
-        root_dir = job["root_dir"]
+        print("\nBrowser opened.")
+        print("Log in if needed on the first page.")
+        print("After that, all queued levels will start downloading in parallel.\n")
 
-        os.makedirs(root_dir, exist_ok=True)
+        page.goto(first_level_url, wait_until="networkidle", timeout=90000)
 
-        print("\n" + "#" * 80)
-        print(f"STARTING LEVEL {job_index}/{len(LEVEL_JOBS)}: {level_name}")
-        print("Folder:", root_dir)
-        print("URL:", level_url)
-        print("#" * 80)
+        print("\nLog in if needed.")
+        print("Make sure the level page is fully loaded.")
+        input("Press ENTER here when ready...")
 
-        page.goto(level_url, wait_until="networkidle", timeout=90000)
+        context.close()
 
-        if job_index == 1:
-            print("\n👉 Log in if needed.")
-            print("👉 Make sure the level page is fully loaded.")
-            input("Press ENTER here when ready...")
-        else:
+
+def clone_profile_for_job(job_index, level_safe):
+    profile_dir = os.path.join(WORKER_PROFILE_ROOT, f"worker_{job_index:02d}_{level_safe}")
+
+    if os.path.exists(profile_dir):
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+    shutil.copytree(BASE_PROFILE_DIR, profile_dir)
+
+    for lock_name in ("SingletonCookie", "SingletonLock", "SingletonSocket"):
+        lock_path = os.path.join(profile_dir, lock_name)
+        if os.path.exists(lock_path):
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+
+    return profile_dir
+
+
+def process_level(job, job_index, total_jobs):
+    level_url = job["url"]
+    level_name = job["level"]
+    level_safe = job["level_safe"]
+    root_dir = job["root_dir"]
+    worker_profile_dir = clone_profile_for_job(job_index, level_safe)
+
+    os.makedirs(root_dir, exist_ok=True)
+
+    print("\n" + "#" * 80)
+    print(f"STARTING LEVEL {job_index}/{total_jobs}: {level_name}")
+    print("Folder:", root_dir)
+    print("URL:", level_url)
+    print("Profile:", worker_profile_dir)
+    print("#" * 80)
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=worker_profile_dir,
+            headless=False
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(level_url, wait_until="networkidle", timeout=90000)
             page.wait_for_timeout(5000)
 
-        lesson_links = collect_lesson_links(page, level_url)
+            lesson_links = collect_lesson_links(page, level_url)
 
-        if not lesson_links:
-            print("\nNo lesson links found. Treating this as one lesson URL.")
-            lesson_links = [level_url]
+            if not lesson_links:
+                print(f"\nNo lesson links found for {level_name}. Treating this as one lesson URL.")
+                lesson_links = [level_url]
 
-        print(f"\nFound {len(lesson_links)} lessons for {level_name}:\n")
+            print(f"\nFound {len(lesson_links)} lessons for {level_name}:\n")
 
-        for i, link in enumerate(lesson_links, 1):
-            print(f"{i:03d}. {link}")
+            for i, link in enumerate(lesson_links, 1):
+                print(f"{i:03d}. {link}")
 
-        all_rows = []
-        skipped_count = 0
+            all_rows = []
+            skipped_count = 0
 
-        for lesson_number, lesson_link in enumerate(lesson_links, 1):
-            if lesson_already_done(root_dir, lesson_number):
-                print(f"\n⏭️ Skipping {level_name} Lesson {lesson_number:03d} because it already has an Anki CSV.")
-                skipped_count += 1
-                continue
+            for lesson_number, lesson_link in enumerate(lesson_links, 1):
+                if lesson_already_done(root_dir, lesson_number):
+                    print(f"\nSkipping {level_name} Lesson {lesson_number:03d} because it already has an Anki CSV.")
+                    skipped_count += 1
+                    continue
 
-            rows = scrape_lesson(
-                context=context,
-                page=page,
-                lesson_url=lesson_link,
-                lesson_number=lesson_number,
-                level_name=level_name,
-                level_safe=level_safe,
-                root_dir=root_dir
+                rows = scrape_lesson(
+                    context=context,
+                    page=page,
+                    lesson_url=lesson_link,
+                    lesson_number=lesson_number,
+                    level_name=level_name,
+                    level_safe=level_safe,
+                    root_dir=root_dir
+                )
+
+                all_rows.extend(rows)
+
+                if lesson_number < len(lesson_links):
+                    print(f"\nResting 20 seconds before next lesson in {level_name}...\n")
+                    time.sleep(20)
+
+            level_master_csv = os.path.join(
+                root_dir,
+                safe_filename(f"{language_safe}_{level_safe}_MASTER_anki", max_len=90) + ".csv"
             )
 
-            all_rows.extend(rows)
-            grand_all_rows.extend(rows)
+            ensure_parent_folder(level_master_csv)
 
-            if lesson_number < len(lesson_links):
-                print("\n⏳ Resting 20 seconds before next lesson...\n")
-                time.sleep(20)
+            df_level = pd.DataFrame(all_rows, columns=["Type", "Front", "Back", "Audio"])
+            df_level.to_csv(level_master_csv, index=False, encoding="utf-8-sig")
 
-        level_master_csv = os.path.join(
-            root_dir,
-            safe_filename(f"{language_safe}_{level_safe}_MASTER_anki", max_len=90) + ".csv"
-        )
+            print("\nDONE WITH LEVEL:", level_name)
+            print("Main folder:", root_dir)
+            print("Level master CSV:", level_master_csv)
+            print("New cards this level:", len(all_rows))
+            print("Skipped lessons this level:", skipped_count)
 
-        ensure_parent_folder(level_master_csv)
+            return {
+                "level_name": level_name,
+                "rows": all_rows,
+                "skipped_count": skipped_count
+            }
+        finally:
+            context.close()
+            shutil.rmtree(worker_profile_dir, ignore_errors=True)
 
-        df_level = pd.DataFrame(all_rows, columns=["Type", "Front", "Back", "Audio"])
-        df_level.to_csv(level_master_csv, index=False, encoding="utf-8-sig")
 
-        print("\nDONE WITH LEVEL:", level_name)
-        print("Main folder:", root_dir)
-        print("Level master CSV:", level_master_csv)
-        print("New cards this level:", len(all_rows))
-        print("Skipped lessons this level:", skipped_count)
+prepare_base_profile(LEVEL_JOBS[0]["url"])
 
-        grand_total_new_cards += len(all_rows)
-        grand_total_skipped += skipped_count
+grand_all_rows = []
+grand_total_new_cards = 0
+grand_total_skipped = 0
 
-        if job_index < len(LEVEL_JOBS):
-            print("\n⏳ Resting 30 seconds before next level...\n")
-            time.sleep(30)
+max_workers = max(1, len(LEVEL_JOBS))
 
-    context.close()
+with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    future_to_job = {
+        executor.submit(process_level, job, job_index, len(LEVEL_JOBS)): job
+        for job_index, job in enumerate(LEVEL_JOBS, 1)
+    }
+
+    for future in as_completed(future_to_job):
+        job = future_to_job[future]
+
+        try:
+            result = future.result()
+        except Exception as e:
+            print(f"\nLevel failed: {job['level']} - {e}")
+            continue
+
+        grand_all_rows.extend(result["rows"])
+        grand_total_new_cards += len(result["rows"])
+        grand_total_skipped += result["skipped_count"]
 
 
 all_levels_master_csv = safe_filename(f"{language_safe}_ALL_LEVELS_MASTER_anki", max_len=90) + ".csv"
@@ -485,3 +547,7 @@ print("\nALL DONE")
 print("Combined master CSV:", all_levels_master_csv)
 print("Total new cards this run:", grand_total_new_cards)
 print("Total skipped lessons:", grand_total_skipped)
+
+
+
+
