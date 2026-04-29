@@ -1,9 +1,11 @@
 import builtins
+import csv
 import hashlib
 import html
 import multiprocessing
 import os
 import queue
+import random
 import re
 import time
 from collections import deque
@@ -16,12 +18,15 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_pla
 
 PROFILE_DIR_BASE = "pod101_profile"
 
-REST_BETWEEN_LESSONS = 20
-REST_BETWEEN_JOB_STARTS = 8
-REST_BETWEEN_JOB_BATCHES = 20
+REST_BETWEEN_LESSONS = 15
+REST_BETWEEN_JOB_STARTS = 15
+REST_BETWEEN_JOB_BATCHES = 15
 
 MAX_PARALLEL_LANGUAGES = 2
 MAX_PARALLEL_URLS_PER_LANGUAGE = 2
+MAX_AUDIO_RETRIES = 3
+JITTER_MIN_SECONDS = 1.5
+JITTER_MAX_SECONDS = 4.0
 
 LESSON_FOLDER_TITLE_MAX = 24
 
@@ -38,6 +43,204 @@ def clean(text):
         return ""
     text = html.unescape(str(text))
     return re.sub(r"\s+", " ", text).strip()
+
+
+def random_rest(min_seconds=JITTER_MIN_SECONDS, max_seconds=JITTER_MAX_SECONDS, label=""):
+    delay = random.uniform(min_seconds, max_seconds)
+    if label:
+        print(f"{label} Waiting {delay:.1f}s...")
+    time.sleep(delay)
+
+
+def get_page_html(page):
+    try:
+        return page.content()
+    except Exception:
+        return ""
+
+
+TYPE_COL = 0
+FRONT_COL = 1
+BACK_COL = 2
+CHOICES_COL = 3
+AUDIO_COL = 4
+LEVEL_TAG_COL = 5
+
+
+def normalize_quotes(text):
+    text = str(text)
+    return (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("â€œ", '"')
+        .replace("â€", '"')
+        .replace("â€˜", "'")
+        .replace("â€™", "'")
+    )
+
+
+def clean_speaker_labels(text):
+    text = re.sub(r"(^|\s)[A-D]:\s*", " ", str(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_quoted_english(text):
+    return " / ".join(
+        match.strip()
+        for match in re.findall(r'"([^"]+)"', normalize_quotes(text))
+        if match.strip()
+    )
+
+
+def remove_quoted_text(text):
+    text = re.sub(r'"[^"]+"', " ", normalize_quotes(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_into_chunks(text, count=4):
+    text = clean(text)
+    words = text.split()
+
+    if len(words) >= count:
+        base_size, remainder = divmod(len(words), count)
+        chunks = []
+        start = 0
+        for index in range(count):
+            size = base_size + (1 if index < remainder else 0)
+            chunks.append(" ".join(words[start:start + size]))
+            start += size
+    else:
+        chars = list(re.sub(r"\s+", "", text))
+        if len(chars) >= count:
+            base_size, remainder = divmod(len(chars), count)
+            chunks = []
+            start = 0
+            for index in range(count):
+                size = base_size + (1 if index < remainder else 0)
+                chunks.append("".join(chars[start:start + size]))
+                start += size
+        else:
+            chunks = chars[:]
+
+    while len(chunks) < count:
+        chunks.append("")
+
+    return chunks[:count]
+
+
+def make_choices(text):
+    chunks = split_into_chunks(text, 4)
+    random.shuffle(chunks)
+    return " ".join(f"{chr(65 + i)}) {chunk}".rstrip() for i, chunk in enumerate(chunks)).strip()
+
+
+def looks_like_audio(text):
+    value = str(text).strip().lower()
+    return value.startswith("[sound:") or value.endswith((".mp3", ".m4a", ".wav", ".ogg"))
+
+
+def has_existing_choices_column(row):
+    return len(row) > CHOICES_COL and str(row[CHOICES_COL]).strip().lower() in {"d", "choices", "choice"}
+
+
+def extract_level_tag(type_value):
+    text = str(type_value).strip()
+    language_match = re.match(r"\s*([^-]+?)\s*-\s*", text)
+    level_match = re.search(r"\bL\s*([0-9]+)\b", text, flags=re.IGNORECASE)
+
+    if not language_match or not level_match:
+        return ""
+
+    language = re.sub(r"[^a-z0-9]+", "", language_match.group(1).lower())
+    return f"{language}pod101level{level_match.group(1)}" if language else ""
+
+
+def is_header_row(row):
+    normalized = [str(cell).strip().lower() for cell in row[:6]]
+    return (
+        len(normalized) >= 4
+        and normalized[0] == "type"
+        and normalized[1] == "front"
+        and normalized[2] == "back"
+        and "audio" in normalized
+    )
+
+
+def ensure_output_columns(row, header=False):
+    row = ["" if value is None else str(value) for value in row]
+
+    while len(row) < 4:
+        row.append("")
+
+    if len(row) == 4 and not has_existing_choices_column(row):
+        row.insert(CHOICES_COL, "Choices" if header else "")
+
+    while len(row) <= LEVEL_TAG_COL:
+        row.append("")
+
+    if looks_like_audio(row[BACK_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[BACK_COL]
+        row[BACK_COL] = ""
+
+    if looks_like_audio(row[CHOICES_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[CHOICES_COL]
+        row[CHOICES_COL] = ""
+
+    if header:
+        row[TYPE_COL] = row[TYPE_COL] or "Type"
+        row[FRONT_COL] = "Front"
+        row[BACK_COL] = "Back"
+        row[CHOICES_COL] = row[CHOICES_COL] or "Choices"
+        row[AUDIO_COL] = "Audio"
+        row[LEVEL_TAG_COL] = row[LEVEL_TAG_COL] or "LevelTag"
+
+    return row
+
+
+def clean_csv_row(row):
+    row = ensure_output_columns(row)
+    front = clean(row[FRONT_COL])
+    back = clean(row[BACK_COL])
+    choices = clean(row[CHOICES_COL])
+
+    if front:
+        front = clean_speaker_labels(normalize_quotes(front))
+        extracted_english = extract_quoted_english(front)
+        cleaned_front = remove_quoted_text(front) or front
+        row[FRONT_COL] = cleaned_front
+
+        if extracted_english and not back:
+            row[BACK_COL] = extracted_english
+        elif back:
+            row[BACK_COL] = normalize_quotes(back).strip()
+
+        if not choices:
+            row[CHOICES_COL] = make_choices(cleaned_front)
+
+    if not clean(row[LEVEL_TAG_COL]):
+        row[LEVEL_TAG_COL] = extract_level_tag(row[TYPE_COL])
+
+    return row
+
+
+def finalize_csv(csv_path):
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+
+    processed = []
+    for index, row in enumerate(rows):
+        if not any(str(cell).strip() for cell in row):
+            processed.append(row)
+        elif index == 0 and is_header_row(row):
+            processed.append(ensure_output_columns(row, header=True))
+        else:
+            processed.append(clean_csv_row(row))
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, quoting=csv.QUOTE_MINIMAL)
+        writer.writerows(processed)
 
 
 def preview(text, max_len=80):
@@ -196,7 +399,8 @@ def choose_url_type(url):
 def prompt_for_job_entries():
     print("\nPaste the Pod101/Class101 URLs you want to scrape.")
     print("You can paste one per line, or paste multiple URLs on one line.")
-    print("Press ENTER on a blank line when you are done.\n")
+    print("Press ENTER on a blank line when you are done adding links.")
+    print("After that, the script will show each saved link one by one for its options.\n")
     print("Only these URL types are supported in this script:")
     print("- Single lesson pages")
     print("- Level pages")
@@ -205,7 +409,7 @@ def prompt_for_job_entries():
     for example in EXAMPLE_URLS:
         print("-", example)
 
-    collected_entries = []
+    collected_urls = []
     seen_keys = set()
 
     while True:
@@ -227,37 +431,51 @@ def prompt_for_job_entries():
             if key in seen_keys:
                 print(f"Skipping duplicate URL: {url}")
                 continue
-
-            detected_language = get_language_from_domain(url)
-            guessed_level = guess_level_from_url(url)
-
-            print("\nURL accepted:")
-            print(url)
-
-            chosen_type = choose_url_type(url)
-            language = clean(input(f"Language for this URL [{detected_language}]: ")) or detected_language
-
-            if guessed_level:
-                level_prompt = f"Level for this URL [{guessed_level}]: "
-            else:
-                level_prompt = "Level for this URL: "
-
-            level = clean(input(level_prompt)) or guessed_level or "unspecified"
-
-            collected_entries.append(
-                {
-                    "url": url,
-                    "url_type": chosen_type,
-                    "language": language,
-                    "level": level,
-                }
-            )
             seen_keys.add(key)
+            collected_urls.append(url)
+            print(f"Saved link {len(collected_urls)}: {url}")
 
-            print(
-                f"Added job {len(collected_entries)}: "
-                f"{language} / {level} / {url_type_label(chosen_type)} / {url}"
-            )
+    if not collected_urls:
+        return []
+
+    print("\nSaved links:")
+    for index, url in enumerate(collected_urls, 1):
+        print(f"{index}. {url}")
+
+    collected_entries = []
+
+    for index, url in enumerate(collected_urls, 1):
+        detected_language = get_language_from_domain(url)
+        guessed_level = guess_level_from_url(url)
+
+        print("\n" + "=" * 95)
+        print(f"LINK {index}/{len(collected_urls)}")
+        print(url)
+        print("=" * 95)
+
+        chosen_type = choose_url_type(url)
+        language = clean(input(f"Language for this URL [{detected_language}]: ")) or detected_language
+
+        if guessed_level:
+            level_prompt = f"Level for this URL [{guessed_level}]: "
+        else:
+            level_prompt = "Level for this URL: "
+
+        level = clean(input(level_prompt)) or guessed_level or "unspecified"
+
+        collected_entries.append(
+            {
+                "url": url,
+                "url_type": chosen_type,
+                "language": language,
+                "level": level,
+            }
+        )
+
+        print(
+            f"Added job {len(collected_entries)}: "
+            f"{language} / {level} / {url_type_label(chosen_type)} / {url}"
+        )
 
     return collected_entries
 
@@ -329,8 +547,18 @@ def group_jobs_by_language(jobs):
     output = []
     for bundle in grouped.values():
         bundle["levels"] = sorted(bundle["levels"])
+        bundle["jobs"] = sorted(
+            bundle["jobs"],
+            key=lambda job: (
+                safe_key(job["level"]),
+                0 if job["url_type"] == "level" else 1,
+                job["job_label"],
+                job["url"],
+            ),
+        )
         output.append(bundle)
 
+    output.sort(key=lambda bundle: bundle["language_safe"])
     return output
 
 
@@ -377,6 +605,7 @@ def save_csv(rows, path):
     rows = dedupe_rows(rows)
     df = pd.DataFrame(rows, columns=["Type", "Front", "Back", "Audio"])
     df.to_csv(path, index=False, encoding="utf-8-sig")
+    finalize_csv(path)
 
 
 def merge_and_save_csv(existing_path, new_rows):
@@ -594,33 +823,42 @@ def collect_lesson_links(page, base_url):
 
 
 def download_audio(context, url, path, label):
-    try:
-        ensure_parent_folder(path)
+    ensure_parent_folder(path)
 
-        if os.path.exists(path) and os.path.getsize(path) > 0:
-            print(f"    Using existing audio for {label}: {abs_path(path)}")
-            return True
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        print(f"    Using existing audio for {label}: {abs_path(path)}")
+        return True
 
-        print(f"    Downloading audio for {label}: {abs_path(path)}")
-        response = context.request.get(url)
+    for attempt in range(1, MAX_AUDIO_RETRIES + 1):
+        try:
+            print(f"    Downloading audio for {label}: {abs_path(path)}")
+            response = context.request.get(url)
 
-        if response.status != 200:
+            if response.status == 200:
+                with open(path, "wb") as file_handle:
+                    file_handle.write(response.body())
+
+                print(f"    Saved audio for {label}: {abs_path(path)}")
+                random_rest(0.4, 1.2)
+                return True
+
             print("    Failed audio request:")
             print("    ", url)
             print("    ", "HTTP", response.status)
+            if attempt < MAX_AUDIO_RETRIES:
+                random_rest(3.0, 8.0, "    Retrying audio.")
+                continue
+
             return False
 
-        with open(path, "wb") as file_handle:
-            file_handle.write(response.body())
-
-        print(f"    Saved audio for {label}: {abs_path(path)}")
-        return True
-
-    except Exception as e:
-        print("    Audio download error:")
-        print("    ", url)
-        print("    ", e)
-        return False
+        except Exception as e:
+            print("    Audio download error:")
+            print("    ", url)
+            print("    ", e)
+            if attempt < MAX_AUDIO_RETRIES:
+                random_rest(3.0, 8.0, "    Retrying audio.")
+                continue
+            return False
 
 
 def extract_dialogue_items(soup, lesson_url, seen_audio):
@@ -801,7 +1039,7 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
         print("Could not open lesson. Skipping.")
         return []
 
-    page_html = page.content()
+    page_html = get_page_html(page)
     soup = BeautifulSoup(page_html, "html.parser")
 
     title = get_page_title_from_html_content(page_html)
@@ -1026,7 +1264,7 @@ def process_level_job(context, page, job, job_index, total_jobs):
 
         if lesson_number < len(lesson_links):
             print(f"\nResting {REST_BETWEEN_LESSONS} seconds before next lesson...\n")
-            time.sleep(REST_BETWEEN_LESSONS)
+            time.sleep(REST_BETWEEN_LESSONS + random.uniform(2, 7))
 
     save_csv(all_rows, get_job_temp_csv(job))
 
@@ -1087,6 +1325,36 @@ def save_language_storage_state(context, language_bundle):
     return storage_state_path
 
 
+def prepare_language_profiles(language_bundles):
+    sessions = []
+
+    with sync_playwright() as playwright:
+        for bundle in language_bundles:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=bundle["profile_dir"],
+                headless=False,
+            )
+            open_login_tabs_for_language(context, bundle)
+            sessions.append((bundle, context))
+
+        if sessions:
+            print("\nLogin these language/site windows before scraping starts:")
+            for bundle, _ in sessions:
+                print(f"- {bundle['language']}")
+            print("After you finish logging in, the script will save those sessions and continue automatically.")
+            input("\nPress ENTER when all login windows are ready... ")
+
+            for bundle, context in sessions:
+                storage_state_path = save_language_storage_state(context, bundle)
+                print(f"Saved login state for {bundle['language']}: {storage_state_path}")
+
+        for _, context in sessions:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+
 def make_job_summary(job, cards, skipped):
     return {
         "language": job["language"],
@@ -1125,198 +1393,115 @@ def merge_level_masters_for_language(language_bundle):
     return master_paths
 
 
-def run_job_worker_from_storage_state(language_bundle, job, job_index, total_jobs, storage_state_path, result_queue):
-    restore_print = install_print_prefix(f"{language_bundle['language']} {job_index:02d}")
-    browser = None
-    context = None
-
-    try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=False)
-            context = browser.new_context(storage_state=storage_state_path)
-            page = context.new_page()
-
-            rows, skipped = process_job(
-                context=context,
-                page=page,
-                job=job,
-                job_index=job_index,
-                total_jobs=total_jobs,
-            )
-
-        result_queue.put(
-            {
-                "job_index": job_index,
-                "status": "ok",
-                "new_cards": len(rows),
-                "skipped": skipped,
-                "job_summary": make_job_summary(job, len(rows), skipped),
-            }
-        )
-    except Exception as e:
-        result_queue.put(
-            {
-                "job_index": job_index,
-                "status": "error",
-                "new_cards": 0,
-                "skipped": 0,
-                "job_summary": make_job_summary(job, 0, 0),
-                "error": str(e),
-            }
-        )
-    finally:
-        if context:
-            try:
-                context.close()
-            except Exception:
-                pass
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        builtins.print = restore_print
-
-
-def drain_result_queue(result_queue):
-    results = []
-
-    while True:
-        try:
-            results.append(result_queue.get_nowait())
-        except queue.Empty:
-            break
-
-    return results
-
-
-def run_jobs_parallel_for_language(language_bundle, storage_state_path):
+def run_jobs_sequential_for_language(language_bundle, storage_state_path):
     jobs = language_bundle["jobs"]
     total_jobs = len(jobs)
+    context = None
 
     if not jobs:
         return [], 0, 0, []
 
-    ctx = multiprocessing.get_context("spawn")
-    result_queue = ctx.Queue()
-    parallel_limit = get_parallel_limit(MAX_PARALLEL_URLS_PER_LANGUAGE, total_jobs)
-    results_by_index = {}
+    ordered_results = []
     total_new_cards = 0
     total_skipped = 0
     job_errors = []
 
-    for batch_start in range(0, total_jobs, parallel_limit):
-        batch = [
-            (job_index, jobs[job_index - 1])
-            for job_index in range(batch_start + 1, min(batch_start + parallel_limit, total_jobs) + 1)
-        ]
-        processes = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=False)
 
-        print("\nStarting URL batch for language:")
-        for job_index, job in batch:
-            print(f"- {job_index}/{total_jobs}: {job['job_label']} ({job['url_type_label']})")
+        try:
+            context = browser.new_context(storage_state=storage_state_path)
+            page = context.new_page()
 
-        for offset, (job_index, job) in enumerate(batch, 1):
-            if offset > 1 and REST_BETWEEN_JOB_STARTS > 0:
-                print(f"\nResting {REST_BETWEEN_JOB_STARTS} seconds before starting the next URL worker...\n")
-                time.sleep(REST_BETWEEN_JOB_STARTS)
+            for job_index, job in enumerate(jobs, 1):
+                if job_index > 1 and REST_BETWEEN_JOB_STARTS > 0:
+                    delay = REST_BETWEEN_JOB_STARTS + random.uniform(1, 4)
+                    print(f"\nResting {delay:.1f} seconds before the next job...\n")
+                    time.sleep(delay)
 
-            process = ctx.Process(
-                target=run_job_worker_from_storage_state,
-                args=(language_bundle, job, job_index, total_jobs, storage_state_path, result_queue),
-            )
-            process.start()
-            processes.append((job_index, job, process))
+                print("\nStarting next job for language:")
+                print(f"- {job_index}/{total_jobs}: {job['job_label']} ({job['url_type_label']})")
 
-        for _, _, process in processes:
-            process.join()
-
-        batch_results = {result["job_index"]: result for result in drain_result_queue(result_queue)}
-
-        for job_index, job, process in processes:
-            result = batch_results.get(job_index)
-
-            if not result:
-                result = {
-                    "job_index": job_index,
-                    "status": "error",
-                    "new_cards": 0,
-                    "skipped": 0,
-                    "job_summary": make_job_summary(job, 0, 0),
-                    "error": f"Job worker exited with code {process.exitcode}",
-                }
-
-            results_by_index[job_index] = result
-            total_new_cards += result.get("new_cards", 0)
-            total_skipped += result.get("skipped", 0)
-
-            if result.get("status") != "ok":
-                job_errors.append(
-                    {
+                try:
+                    rows, skipped = process_job(
+                        context=context,
+                        page=page,
+                        job=job,
+                        job_index=job_index,
+                        total_jobs=total_jobs,
+                    )
+                    result = {
                         "job_index": job_index,
-                        "language": job["language"],
-                        "level": job["level"],
-                        "type": job["url_type_label"],
-                        "label": job["job_label"],
-                        "error": result.get("error", "Unknown error"),
+                        "status": "ok",
+                        "new_cards": len(rows),
+                        "skipped": skipped,
+                        "job_summary": make_job_summary(job, len(rows), skipped),
                     }
-                )
+                except Exception as e:
+                    result = {
+                        "job_index": job_index,
+                        "status": "error",
+                        "new_cards": 0,
+                        "skipped": 0,
+                        "job_summary": make_job_summary(job, 0, 0),
+                        "error": str(e),
+                    }
 
-            print("\nLANGUAGE RUNNING TOTAL")
-            print("-" * 75)
-            print(f"Finished job:       {job_index}/{total_jobs}")
-            print(f"Cards this job:     {result.get('new_cards', 0)}")
-            print(f"Skipped this job:   {result.get('skipped', 0)}")
-            print(f"Language new cards: {total_new_cards}")
-            print(f"Language skipped:   {total_skipped}")
-            if result.get("status") != "ok":
-                print(f"Job error:          {result.get('error', 'Unknown error')}")
-            print("-" * 75)
+                ordered_results.append(result)
+                total_new_cards += result.get("new_cards", 0)
+                total_skipped += result.get("skipped", 0)
 
-        if batch_start + parallel_limit < total_jobs and REST_BETWEEN_JOB_BATCHES > 0:
-            print(f"\nResting {REST_BETWEEN_JOB_BATCHES} seconds before the next URL batch...\n")
-            time.sleep(REST_BETWEEN_JOB_BATCHES)
+                if result.get("status") != "ok":
+                    job_errors.append(
+                        {
+                            "job_index": job_index,
+                            "language": job["language"],
+                            "level": job["level"],
+                            "type": job["url_type_label"],
+                            "label": job["job_label"],
+                            "error": result.get("error", "Unknown error"),
+                        }
+                    )
 
-    ordered_results = [results_by_index[index] for index in sorted(results_by_index)]
+                print("\nLANGUAGE RUNNING TOTAL")
+                print("-" * 75)
+                print(f"Finished job:       {job_index}/{total_jobs}")
+                print(f"Cards this job:     {result.get('new_cards', 0)}")
+                print(f"Skipped this job:   {result.get('skipped', 0)}")
+                print(f"Language new cards: {total_new_cards}")
+                print(f"Language skipped:   {total_skipped}")
+                if result.get("status") != "ok":
+                    print(f"Job error:          {result.get('error', 'Unknown error')}")
+                print("-" * 75)
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
     return ordered_results, total_new_cards, total_skipped, job_errors
 
 
-def run_language_worker(language_bundle, control_queue, start_event, result_queue):
+def run_language_worker(language_bundle):
     restore_print = install_print_prefix(language_bundle["language"])
-    context = None
-    login_signal_sent = False
-    storage_state_path = ""
-
     total_new_cards = 0
     total_skipped = 0
     job_summaries = []
     job_errors = []
     level_master_paths = []
+    storage_state_path = get_language_storage_state_path(language_bundle)
 
     try:
-        with sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=language_bundle["profile_dir"],
-                headless=False,
+        if not os.path.exists(storage_state_path):
+            raise RuntimeError(
+                f"Missing saved login state for {language_bundle['language']}: {storage_state_path}"
             )
-            open_login_tabs_for_language(context, language_bundle)
-            control_queue.put(
-                {
-                    "kind": "login_ready",
-                    "language": language_bundle["language"],
-                    "language_safe": language_bundle["language_safe"],
-                }
-            )
-            login_signal_sent = True
 
-            print("\nLogin tabs are ready in this worker.")
-            print("Waiting for the main script to continue after you finish logging in...")
-            start_event.wait()
-            storage_state_path = save_language_storage_state(context, language_bundle)
-
-        context = None
-
-        ordered_job_results, total_new_cards, total_skipped, job_errors = run_jobs_parallel_for_language(
+        ordered_job_results, total_new_cards, total_skipped, job_errors = run_jobs_sequential_for_language(
             language_bundle,
             storage_state_path,
         )
@@ -1325,13 +1510,17 @@ def run_language_worker(language_bundle, control_queue, start_event, result_queu
             for result in ordered_job_results
             if result.get("status") == "ok"
         ]
+
         level_master_paths = merge_level_masters_for_language(language_bundle)
 
         print("\nLANGUAGE SUMMARY")
         print("=" * 85)
         print(f"Language:              {language_bundle['language']}")
         print(f"Jobs completed:        {len(language_bundle['jobs'])}")
-        print(f"Parallel URL workers:  {get_parallel_limit(MAX_PARALLEL_URLS_PER_LANGUAGE, len(language_bundle['jobs']))}")
+        print(
+            f"Parallel URL workers:  "
+            f"{get_parallel_limit(MAX_PARALLEL_URLS_PER_LANGUAGE, len(language_bundle['jobs']))}"
+        )
         print(f"Total new cards:       {total_new_cards}")
         print(f"Total skipped lessons: {total_skipped}")
         print(f"Level master CSVs:     {len(level_master_paths)}")
@@ -1339,48 +1528,29 @@ def run_language_worker(language_bundle, control_queue, start_event, result_queu
             print(f"Job errors:            {len(job_errors)}")
         print("=" * 85)
 
-        result_queue.put(
-            {
-                "language": language_bundle["language"],
-                "language_safe": language_bundle["language_safe"],
-                "job_summaries": job_summaries,
-                "new_cards": total_new_cards,
-                "skipped": total_skipped,
-                "errors": job_errors,
-                "level_master_paths": level_master_paths,
-                "status": "ok" if not job_errors else "error",
-            }
-        )
+        return {
+            "language": language_bundle["language"],
+            "language_safe": language_bundle["language_safe"],
+            "job_summaries": job_summaries,
+            "new_cards": total_new_cards,
+            "skipped": total_skipped,
+            "errors": job_errors,
+            "level_master_paths": level_master_paths,
+            "status": "ok" if not job_errors else "error",
+        }
     except Exception as e:
-        if not login_signal_sent:
-            control_queue.put(
-                {
-                    "kind": "login_error",
-                    "language": language_bundle["language"],
-                    "language_safe": language_bundle["language_safe"],
-                    "error": str(e),
-                }
-            )
-
-        result_queue.put(
-            {
-                "language": language_bundle["language"],
-                "language_safe": language_bundle["language_safe"],
-                "job_summaries": job_summaries,
-                "new_cards": total_new_cards,
-                "skipped": total_skipped,
-                "errors": job_errors,
-                "level_master_paths": level_master_paths,
-                "status": "error",
-                "error": str(e),
-            }
-        )
+        return {
+            "language": language_bundle["language"],
+            "language_safe": language_bundle["language_safe"],
+            "job_summaries": job_summaries,
+            "new_cards": total_new_cards,
+            "skipped": total_skipped,
+            "errors": job_errors,
+            "level_master_paths": level_master_paths,
+            "status": "error",
+            "error": str(e),
+        }
     finally:
-        if context:
-            try:
-                context.close()
-            except Exception:
-                pass
         if storage_state_path and os.path.exists(storage_state_path):
             try:
                 os.remove(storage_state_path)
@@ -1389,109 +1559,24 @@ def run_language_worker(language_bundle, control_queue, start_event, result_queu
         builtins.print = restore_print
 
 
-def run_languages_parallel(language_bundles):
+def run_languages_sequential(language_bundles):
     if not language_bundles:
         return []
 
-    ctx = multiprocessing.get_context("spawn")
-    control_queue = ctx.Queue()
-    result_queue = ctx.Queue()
     results = []
 
-    parallel_limit = get_parallel_limit(MAX_PARALLEL_LANGUAGES, len(language_bundles))
+    for bundle_index, bundle in enumerate(language_bundles, 1):
+        print("\nStarting language:")
+        print(f"- {bundle_index}/{len(language_bundles)}: {bundle['language']} ({len(bundle['jobs'])} jobs)")
 
-    for start in range(0, len(language_bundles), parallel_limit):
-        batch = language_bundles[start : start + parallel_limit]
-        processes = []
-        start_event = ctx.Event()
+        if bundle_index > 1 and REST_BETWEEN_JOB_BATCHES > 0:
+            delay = REST_BETWEEN_JOB_BATCHES + random.uniform(1, 4)
+            print(f"\nResting {delay:.1f} seconds before the next language...\n")
+            time.sleep(delay)
 
-        print("\nStarting parallel language batch:")
-        for bundle in batch:
-            print(f"- {bundle['language']} ({len(bundle['jobs'])} jobs)")
+        results.append(run_language_worker(bundle))
 
-        for bundle in batch:
-            process = ctx.Process(
-                target=run_language_worker,
-                args=(bundle, control_queue, start_event, result_queue),
-            )
-            process.start()
-            processes.append((bundle, process))
-
-        login_status_by_language = {}
-
-        while len(login_status_by_language) < len(batch):
-            signal = control_queue.get()
-            language_safe = signal["language_safe"]
-
-            if language_safe in login_status_by_language:
-                continue
-
-            login_status_by_language[language_safe] = signal
-
-            if signal["kind"] == "login_ready":
-                print(f"Login window ready for {signal['language']}.")
-            else:
-                print(f"Could not prepare login window for {signal['language']}: {signal.get('error', 'Unknown error')}")
-
-        ready_languages = [
-            signal["language"]
-            for signal in login_status_by_language.values()
-            if signal["kind"] == "login_ready"
-        ]
-
-        if ready_languages:
-            print("\nThese login windows will prepare the session for the download workers:")
-            for language in ready_languages:
-                print(f"- {language}")
-            print("Log in to them now. After that, the script will reuse that session across the parallel download workers.")
-            input("\nPress ENTER when these language logins are done... ")
-
-        start_event.set()
-
-        for bundle, process in processes:
-            process.join()
-
-            if process.exitcode != 0:
-                results.append(
-                    {
-                        "language": bundle["language"],
-                        "language_safe": bundle["language_safe"],
-                        "job_summaries": [],
-                        "new_cards": 0,
-                        "skipped": 0,
-                        "errors": [],
-                        "level_master_paths": [],
-                        "status": "error",
-                        "error": f"Worker exited with code {process.exitcode}",
-                    }
-                )
-
-        results.extend(drain_result_queue(result_queue))
-
-    deduped_results = {}
-    for result in results:
-        deduped_results[result["language_safe"]] = result
-
-    ordered_results = []
-    for bundle in language_bundles:
-        ordered_results.append(
-            deduped_results.get(
-                bundle["language_safe"],
-                {
-                    "language": bundle["language"],
-                    "language_safe": bundle["language_safe"],
-                    "job_summaries": [],
-                    "new_cards": 0,
-                    "skipped": 0,
-                    "errors": [],
-                    "level_master_paths": [],
-                    "status": "error",
-                    "error": "No worker result returned",
-                },
-            )
-        )
-
-    return ordered_results
+    return results
 
 
 def main():
@@ -1519,7 +1604,7 @@ def main():
 
     language_bundles = group_jobs_by_language(jobs)
 
-    print("\nLanguage workers that will run in parallel:")
+    print("\nLanguages that will run in order:")
     for bundle in language_bundles:
         print(
             f"- {bundle['language']}: {len(bundle['jobs'])} jobs, "
@@ -1531,15 +1616,16 @@ def main():
     print("- Each lesson folder gets its own audio files and anki.csv")
     print("- Each level folder gets one MASTER_anki.csv")
 
-    print("\nParallel mode:")
-    print(f"- Up to {get_parallel_limit(MAX_PARALLEL_LANGUAGES, len(language_bundles))} languages at once.")
-    print(f"- Up to {get_parallel_limit(MAX_PARALLEL_URLS_PER_LANGUAGE, max((len(bundle['jobs']) for bundle in language_bundles), default=1))} URLs at once inside each language.")
-    print(f"- {REST_BETWEEN_JOB_STARTS} seconds between starting parallel URL workers.")
-    print(f"- {REST_BETWEEN_JOB_BATCHES} seconds between URL batches.")
+    print("\nRun mode:")
+    print("- Languages run one at a time.")
+    print("- Jobs inside each language run one at a time.")
+    print(f"- {REST_BETWEEN_JOB_STARTS} seconds between jobs.")
+    print(f"- {REST_BETWEEN_JOB_BATCHES} seconds between languages.")
     print(f"- {REST_BETWEEN_LESSONS} seconds between lessons inside one level page.")
 
     try:
-        worker_results = run_languages_parallel(language_bundles)
+        prepare_language_profiles(language_bundles)
+        worker_results = run_languages_sequential(language_bundles)
 
         print("\nFINAL SUMMARY")
         print("=" * 95)

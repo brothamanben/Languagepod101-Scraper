@@ -2,6 +2,8 @@ import os
 import re
 import html
 import time
+import csv
+import random
 import pandas as pd
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -23,6 +25,190 @@ def clean(text):
         return ""
     text = html.unescape(str(text))
     return re.sub(r"\s+", " ", text).strip()
+
+
+TYPE_COL = 0
+FRONT_COL = 1
+BACK_COL = 2
+CHOICES_COL = 3
+AUDIO_COL = 4
+LEVEL_TAG_COL = 5
+
+
+def normalize_quotes(text):
+    text = str(text)
+    return (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("â€œ", '"')
+        .replace("â€", '"')
+        .replace("â€˜", "'")
+        .replace("â€™", "'")
+    )
+
+
+def clean_speaker_labels(text):
+    text = re.sub(r"(^|\s)[A-D]:\s*", " ", str(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_quoted_english(text):
+    return " / ".join(
+        match.strip()
+        for match in re.findall(r'"([^"]+)"', normalize_quotes(text))
+        if match.strip()
+    )
+
+
+def remove_quoted_text(text):
+    text = re.sub(r'"[^"]+"', " ", normalize_quotes(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_into_chunks(text, count=4):
+    text = clean(text)
+    words = text.split()
+
+    if len(words) >= count:
+        base_size, remainder = divmod(len(words), count)
+        chunks = []
+        start = 0
+        for index in range(count):
+            size = base_size + (1 if index < remainder else 0)
+            chunks.append(" ".join(words[start:start + size]))
+            start += size
+    else:
+        chars = list(re.sub(r"\s+", "", text))
+        if len(chars) >= count:
+            base_size, remainder = divmod(len(chars), count)
+            chunks = []
+            start = 0
+            for index in range(count):
+                size = base_size + (1 if index < remainder else 0)
+                chunks.append("".join(chars[start:start + size]))
+                start += size
+        else:
+            chunks = chars[:]
+
+    while len(chunks) < count:
+        chunks.append("")
+
+    return chunks[:count]
+
+
+def make_choices(text):
+    chunks = split_into_chunks(text, 4)
+    random.shuffle(chunks)
+    return " ".join(f"{chr(65 + i)}) {chunk}".rstrip() for i, chunk in enumerate(chunks)).strip()
+
+
+def looks_like_audio(text):
+    value = str(text).strip().lower()
+    return value.startswith("[sound:") or value.endswith((".mp3", ".m4a", ".wav", ".ogg"))
+
+
+def has_existing_choices_column(row):
+    return len(row) > CHOICES_COL and str(row[CHOICES_COL]).strip().lower() in {"d", "choices", "choice"}
+
+
+def extract_level_tag(type_value):
+    text = str(type_value).strip()
+    language_match = re.match(r"\s*([^-]+?)\s*-\s*", text)
+    level_match = re.search(r"\bL\s*([0-9]+)\b", text, flags=re.IGNORECASE)
+
+    if not language_match or not level_match:
+        return ""
+
+    language = re.sub(r"[^a-z0-9]+", "", language_match.group(1).lower())
+    return f"{language}pod101level{level_match.group(1)}" if language else ""
+
+
+def is_header_row(row):
+    normalized = [str(cell).strip().lower() for cell in row[:6]]
+    return (
+        len(normalized) >= 4
+        and normalized[0] == "type"
+        and normalized[1] == "front"
+        and normalized[2] == "back"
+        and "audio" in normalized
+    )
+
+
+def ensure_output_columns(row, header=False):
+    row = ["" if value is None else str(value) for value in row]
+
+    while len(row) < 4:
+        row.append("")
+
+    if len(row) == 4 and not has_existing_choices_column(row):
+        row.insert(CHOICES_COL, "Choices" if header else "")
+
+    while len(row) <= LEVEL_TAG_COL:
+        row.append("")
+
+    if looks_like_audio(row[BACK_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[BACK_COL]
+        row[BACK_COL] = ""
+
+    if looks_like_audio(row[CHOICES_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[CHOICES_COL]
+        row[CHOICES_COL] = ""
+
+    if header:
+        row[TYPE_COL] = row[TYPE_COL] or "Type"
+        row[FRONT_COL] = "Front"
+        row[BACK_COL] = "Back"
+        row[CHOICES_COL] = row[CHOICES_COL] or "Choices"
+        row[AUDIO_COL] = "Audio"
+        row[LEVEL_TAG_COL] = row[LEVEL_TAG_COL] or "LevelTag"
+
+    return row
+
+
+def clean_csv_row(row):
+    row = ensure_output_columns(row)
+    front = clean(row[FRONT_COL])
+    back = clean(row[BACK_COL])
+    choices = clean(row[CHOICES_COL])
+
+    if front:
+        front = clean_speaker_labels(normalize_quotes(front))
+        extracted_english = extract_quoted_english(front)
+        cleaned_front = remove_quoted_text(front) or front
+        row[FRONT_COL] = cleaned_front
+
+        if extracted_english and not back:
+            row[BACK_COL] = extracted_english
+        elif back:
+            row[BACK_COL] = normalize_quotes(back).strip()
+
+        if not choices:
+            row[CHOICES_COL] = make_choices(cleaned_front)
+
+    if not clean(row[LEVEL_TAG_COL]):
+        row[LEVEL_TAG_COL] = extract_level_tag(row[TYPE_COL])
+
+    return row
+
+
+def finalize_csv(csv_path):
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+
+    processed = []
+    for index, row in enumerate(rows):
+        if not any(str(cell).strip() for cell in row):
+            processed.append(row)
+        elif index == 0 and is_header_row(row):
+            processed.append(ensure_output_columns(row, header=True))
+        else:
+            processed.append(clean_csv_row(row))
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, quoting=csv.QUOTE_MINIMAL)
+        writer.writerows(processed)
 
 
 def safe_filename(text, max_len=45):
@@ -336,6 +522,7 @@ def scrape_lesson(context, page, lesson_url, lesson_number):
 
     df = pd.DataFrame(rows, columns=["Type", "Front", "Back", "Audio"])
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    finalize_csv(csv_path)
 
     print("Dialogue:", dialogue_count)
     print("Vocab words:", vocab_count)
@@ -409,6 +596,7 @@ ensure_parent_folder(master_csv)
 
 df_master = pd.DataFrame(all_rows, columns=["Type", "Front", "Back", "Audio"])
 df_master.to_csv(master_csv, index=False, encoding="utf-8-sig")
+finalize_csv(master_csv)
 
 print("\nDONE")
 print("Main folder:", ROOT_DIR)

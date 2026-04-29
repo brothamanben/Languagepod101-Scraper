@@ -2,8 +2,8 @@
 import re
 import html
 import time
-import shutil
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
+import random
 import pandas as pd
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -63,6 +63,190 @@ def clean(text):
         return ""
     text = html.unescape(str(text))
     return re.sub(r"\s+", " ", text).strip()
+
+
+TYPE_COL = 0
+FRONT_COL = 1
+BACK_COL = 2
+CHOICES_COL = 3
+AUDIO_COL = 4
+LEVEL_TAG_COL = 5
+
+
+def normalize_quotes(text):
+    text = str(text)
+    return (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("â€œ", '"')
+        .replace("â€", '"')
+        .replace("â€˜", "'")
+        .replace("â€™", "'")
+    )
+
+
+def clean_speaker_labels(text):
+    text = re.sub(r"(^|\s)[A-D]:\s*", " ", str(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_quoted_english(text):
+    return " / ".join(
+        match.strip()
+        for match in re.findall(r'"([^"]+)"', normalize_quotes(text))
+        if match.strip()
+    )
+
+
+def remove_quoted_text(text):
+    text = re.sub(r'"[^"]+"', " ", normalize_quotes(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_into_chunks(text, count=4):
+    text = clean(text)
+    words = text.split()
+
+    if len(words) >= count:
+        base_size, remainder = divmod(len(words), count)
+        chunks = []
+        start = 0
+        for index in range(count):
+            size = base_size + (1 if index < remainder else 0)
+            chunks.append(" ".join(words[start:start + size]))
+            start += size
+    else:
+        chars = list(re.sub(r"\s+", "", text))
+        if len(chars) >= count:
+            base_size, remainder = divmod(len(chars), count)
+            chunks = []
+            start = 0
+            for index in range(count):
+                size = base_size + (1 if index < remainder else 0)
+                chunks.append("".join(chars[start:start + size]))
+                start += size
+        else:
+            chunks = chars[:]
+
+    while len(chunks) < count:
+        chunks.append("")
+
+    return chunks[:count]
+
+
+def make_choices(text):
+    chunks = split_into_chunks(text, 4)
+    random.shuffle(chunks)
+    return " ".join(f"{chr(65 + i)}) {chunk}".rstrip() for i, chunk in enumerate(chunks)).strip()
+
+
+def looks_like_audio(text):
+    value = str(text).strip().lower()
+    return value.startswith("[sound:") or value.endswith((".mp3", ".m4a", ".wav", ".ogg"))
+
+
+def has_existing_choices_column(row):
+    return len(row) > CHOICES_COL and str(row[CHOICES_COL]).strip().lower() in {"d", "choices", "choice"}
+
+
+def extract_level_tag(type_value):
+    text = str(type_value).strip()
+    language_match = re.match(r"\s*([^-]+?)\s*-\s*", text)
+    level_match = re.search(r"\bL\s*([0-9]+)\b", text, flags=re.IGNORECASE)
+
+    if not language_match or not level_match:
+        return ""
+
+    language = re.sub(r"[^a-z0-9]+", "", language_match.group(1).lower())
+    return f"{language}pod101level{level_match.group(1)}" if language else ""
+
+
+def is_header_row(row):
+    normalized = [str(cell).strip().lower() for cell in row[:6]]
+    return (
+        len(normalized) >= 4
+        and normalized[0] == "type"
+        and normalized[1] == "front"
+        and normalized[2] == "back"
+        and "audio" in normalized
+    )
+
+
+def ensure_output_columns(row, header=False):
+    row = ["" if value is None else str(value) for value in row]
+
+    while len(row) < 4:
+        row.append("")
+
+    if len(row) == 4 and not has_existing_choices_column(row):
+        row.insert(CHOICES_COL, "Choices" if header else "")
+
+    while len(row) <= LEVEL_TAG_COL:
+        row.append("")
+
+    if looks_like_audio(row[BACK_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[BACK_COL]
+        row[BACK_COL] = ""
+
+    if looks_like_audio(row[CHOICES_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[CHOICES_COL]
+        row[CHOICES_COL] = ""
+
+    if header:
+        row[TYPE_COL] = row[TYPE_COL] or "Type"
+        row[FRONT_COL] = "Front"
+        row[BACK_COL] = "Back"
+        row[CHOICES_COL] = row[CHOICES_COL] or "Choices"
+        row[AUDIO_COL] = "Audio"
+        row[LEVEL_TAG_COL] = row[LEVEL_TAG_COL] or "LevelTag"
+
+    return row
+
+
+def clean_csv_row(row):
+    row = ensure_output_columns(row)
+    front = clean(row[FRONT_COL])
+    back = clean(row[BACK_COL])
+    choices = clean(row[CHOICES_COL])
+
+    if front:
+        front = clean_speaker_labels(normalize_quotes(front))
+        extracted_english = extract_quoted_english(front)
+        cleaned_front = remove_quoted_text(front) or front
+        row[FRONT_COL] = cleaned_front
+
+        if extracted_english and not back:
+            row[BACK_COL] = extracted_english
+        elif back:
+            row[BACK_COL] = normalize_quotes(back).strip()
+
+        if not choices:
+            row[CHOICES_COL] = make_choices(cleaned_front)
+
+    if not clean(row[LEVEL_TAG_COL]):
+        row[LEVEL_TAG_COL] = extract_level_tag(row[TYPE_COL])
+
+    return row
+
+
+def finalize_csv(csv_path):
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+
+    processed = []
+    for index, row in enumerate(rows):
+        if not any(str(cell).strip() for cell in row):
+            processed.append(row)
+        elif index == 0 and is_header_row(row):
+            processed.append(ensure_output_columns(row, header=True))
+        else:
+            processed.append(clean_csv_row(row))
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, quoting=csv.QUOTE_MINIMAL)
+        writer.writerows(processed)
 
 
 def safe_filename(text, max_len=45):
@@ -365,6 +549,7 @@ def scrape_lesson(context, page, lesson_url, lesson_number, level_name, level_sa
 
     df = pd.DataFrame(rows, columns=["Type", "Front", "Back", "Audio"])
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    finalize_csv(csv_path)
 
     print("Dialogue:", dialogue_count)
     print("Vocab words:", vocab_count)
@@ -376,57 +561,13 @@ def scrape_lesson(context, page, lesson_url, lesson_number, level_name, level_sa
 
 
 BASE_PROFILE_DIR = os.path.abspath("pod101_profile")
-WORKER_PROFILE_ROOT = os.path.abspath("pod101_worker_profiles")
 
 
-def prepare_base_profile(first_level_url):
-    os.makedirs(WORKER_PROFILE_ROOT, exist_ok=True)
-
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=BASE_PROFILE_DIR,
-            headless=False
-        )
-        page = context.new_page()
-
-        print("\nBrowser opened.")
-        print("Log in if needed on the first page.")
-        print("After that, all queued levels will start downloading in parallel.\n")
-
-        page.goto(first_level_url, wait_until="networkidle", timeout=90000)
-
-        print("\nLog in if needed.")
-        print("Make sure the level page is fully loaded.")
-        input("Press ENTER here when ready...")
-
-        context.close()
-
-
-def clone_profile_for_job(job_index, level_safe):
-    profile_dir = os.path.join(WORKER_PROFILE_ROOT, f"worker_{job_index:02d}_{level_safe}")
-
-    if os.path.exists(profile_dir):
-        shutil.rmtree(profile_dir, ignore_errors=True)
-
-    shutil.copytree(BASE_PROFILE_DIR, profile_dir)
-
-    for lock_name in ("SingletonCookie", "SingletonLock", "SingletonSocket"):
-        lock_path = os.path.join(profile_dir, lock_name)
-        if os.path.exists(lock_path):
-            try:
-                os.remove(lock_path)
-            except OSError:
-                pass
-
-    return profile_dir
-
-
-def process_level(job, job_index, total_jobs):
+def process_level(context, page, job, job_index, total_jobs):
     level_url = job["url"]
     level_name = job["level"]
     level_safe = job["level_safe"]
     root_dir = job["root_dir"]
-    worker_profile_dir = clone_profile_for_job(job_index, level_safe)
 
     os.makedirs(root_dir, exist_ok=True)
 
@@ -434,101 +575,96 @@ def process_level(job, job_index, total_jobs):
     print(f"STARTING LEVEL {job_index}/{total_jobs}: {level_name}")
     print("Folder:", root_dir)
     print("URL:", level_url)
-    print("Profile:", worker_profile_dir)
+    print("Profile:", BASE_PROFILE_DIR)
     print("#" * 80)
 
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=worker_profile_dir,
-            headless=False
+    page.goto(level_url, wait_until="networkidle", timeout=90000)
+    page.wait_for_timeout(5000)
+
+    lesson_links = collect_lesson_links(page, level_url)
+
+    if not lesson_links:
+        print(f"\nNo lesson links found for {level_name}. Treating this as one lesson URL.")
+        lesson_links = [level_url]
+
+    print(f"\nFound {len(lesson_links)} lessons for {level_name}:\n")
+
+    for i, link in enumerate(lesson_links, 1):
+        print(f"{i:03d}. {link}")
+
+    all_rows = []
+    skipped_count = 0
+
+    for lesson_number, lesson_link in enumerate(lesson_links, 1):
+        if lesson_already_done(root_dir, lesson_number):
+            print(f"\nSkipping {level_name} Lesson {lesson_number:03d} because it already has an Anki CSV.")
+            skipped_count += 1
+            continue
+
+        rows = scrape_lesson(
+            context=context,
+            page=page,
+            lesson_url=lesson_link,
+            lesson_number=lesson_number,
+            level_name=level_name,
+            level_safe=level_safe,
+            root_dir=root_dir
         )
-        page = context.new_page()
 
-        try:
-            page.goto(level_url, wait_until="networkidle", timeout=90000)
-            page.wait_for_timeout(5000)
+        all_rows.extend(rows)
 
-            lesson_links = collect_lesson_links(page, level_url)
+        if lesson_number < len(lesson_links):
+            print(f"\nResting 20 seconds before next lesson in {level_name}...\n")
+            time.sleep(20)
 
-            if not lesson_links:
-                print(f"\nNo lesson links found for {level_name}. Treating this as one lesson URL.")
-                lesson_links = [level_url]
+    level_master_csv = os.path.join(
+        root_dir,
+        safe_filename(f"{language_safe}_{level_safe}_MASTER_anki", max_len=90) + ".csv"
+    )
 
-            print(f"\nFound {len(lesson_links)} lessons for {level_name}:\n")
+    ensure_parent_folder(level_master_csv)
 
-            for i, link in enumerate(lesson_links, 1):
-                print(f"{i:03d}. {link}")
+    df_level = pd.DataFrame(all_rows, columns=["Type", "Front", "Back", "Audio"])
+    df_level.to_csv(level_master_csv, index=False, encoding="utf-8-sig")
+    finalize_csv(level_master_csv)
 
-            all_rows = []
-            skipped_count = 0
+    print("\nDONE WITH LEVEL:", level_name)
+    print("Main folder:", root_dir)
+    print("Level master CSV:", level_master_csv)
+    print("New cards this level:", len(all_rows))
+    print("Skipped lessons this level:", skipped_count)
 
-            for lesson_number, lesson_link in enumerate(lesson_links, 1):
-                if lesson_already_done(root_dir, lesson_number):
-                    print(f"\nSkipping {level_name} Lesson {lesson_number:03d} because it already has an Anki CSV.")
-                    skipped_count += 1
-                    continue
+    return {
+        "level_name": level_name,
+        "rows": all_rows,
+        "skipped_count": skipped_count
+    }
 
-                rows = scrape_lesson(
-                    context=context,
-                    page=page,
-                    lesson_url=lesson_link,
-                    lesson_number=lesson_number,
-                    level_name=level_name,
-                    level_safe=level_safe,
-                    root_dir=root_dir
-                )
-
-                all_rows.extend(rows)
-
-                if lesson_number < len(lesson_links):
-                    print(f"\nResting 20 seconds before next lesson in {level_name}...\n")
-                    time.sleep(20)
-
-            level_master_csv = os.path.join(
-                root_dir,
-                safe_filename(f"{language_safe}_{level_safe}_MASTER_anki", max_len=90) + ".csv"
-            )
-
-            ensure_parent_folder(level_master_csv)
-
-            df_level = pd.DataFrame(all_rows, columns=["Type", "Front", "Back", "Audio"])
-            df_level.to_csv(level_master_csv, index=False, encoding="utf-8-sig")
-
-            print("\nDONE WITH LEVEL:", level_name)
-            print("Main folder:", root_dir)
-            print("Level master CSV:", level_master_csv)
-            print("New cards this level:", len(all_rows))
-            print("Skipped lessons this level:", skipped_count)
-
-            return {
-                "level_name": level_name,
-                "rows": all_rows,
-                "skipped_count": skipped_count
-            }
-        finally:
-            context.close()
-            shutil.rmtree(worker_profile_dir, ignore_errors=True)
-
-
-prepare_base_profile(LEVEL_JOBS[0]["url"])
 
 grand_all_rows = []
 grand_total_new_cards = 0
 grand_total_skipped = 0
 
-max_workers = max(1, len(LEVEL_JOBS))
+with sync_playwright() as p:
+    context = p.chromium.launch_persistent_context(
+        user_data_dir=BASE_PROFILE_DIR,
+        headless=False
+    )
+    page = context.new_page()
 
-with ThreadPoolExecutor(max_workers=max_workers) as executor:
-    future_to_job = {
-        executor.submit(process_level, job, job_index, len(LEVEL_JOBS)): job
-        for job_index, job in enumerate(LEVEL_JOBS, 1)
-    }
+    print("\nBrowser opened.")
+    print("Log in if needed on the first page.")
+    print("This same logged-in browser will be used for the full scrape.\n")
 
-    for future in as_completed(future_to_job):
-        job = future_to_job[future]
+    page.goto(LEVEL_JOBS[0]["url"], wait_until="networkidle", timeout=90000)
 
+    print("\nLog in if needed.")
+    print("Make sure the level page is fully loaded.")
+    input("Press ENTER here when ready...")
+
+    for job_index, job in enumerate(LEVEL_JOBS, 1):
         try:
-            result = future.result()
+            result = process_level(context, page, job, job_index, len(LEVEL_JOBS))
         except Exception as e:
             print(f"\nLevel failed: {job['level']} - {e}")
             continue
@@ -537,11 +673,14 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
         grand_total_new_cards += len(result["rows"])
         grand_total_skipped += result["skipped_count"]
 
+    context.close()
+
 
 all_levels_master_csv = safe_filename(f"{language_safe}_ALL_LEVELS_MASTER_anki", max_len=90) + ".csv"
 
 df_all = pd.DataFrame(grand_all_rows, columns=["Type", "Front", "Back", "Audio"])
 df_all.to_csv(all_levels_master_csv, index=False, encoding="utf-8-sig")
+finalize_csv(all_levels_master_csv)
 
 print("\nALL DONE")
 print("Combined master CSV:", all_levels_master_csv)
