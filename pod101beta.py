@@ -1,8 +1,8 @@
 import builtins
+import csv
 import html
-import multiprocessing
 import os
-import queue
+import random
 import re
 import time
 from collections import deque
@@ -14,6 +14,8 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_pla
 
 
 PROFILE_DIR_BASE = "pod101_profile"
+LOGIN_EMAIL = "fooheads@gmail.com"
+LOGIN_PASSWORD = "Iloveyoumax1127!"
 
 REST_BETWEEN_LESSONS = 20
 REST_BETWEEN_JOBS = 20
@@ -23,9 +25,6 @@ FILE_NAME_MAX = 110
 
 MAX_LIBRARY_DEPTH = 6
 MAX_LIBRARY_PAGES = 500
-
-# 0 means "run all languages in parallel".
-MAX_PARALLEL_LANGUAGES = 0
 
 # Example URL shapes this script accepts.
 EXAMPLE_URLS = [
@@ -86,6 +85,192 @@ def preview(text, max_len=80):
     if len(text) <= max_len:
         return text
     return text[: max_len - 3].rstrip() + "..."
+
+
+TYPE_COL = 0
+FRONT_COL = 1
+BACK_COL = 2
+CHOICES_COL = 3
+AUDIO_COL = 4
+TAGS_COL = 5
+
+
+def normalize_quotes(text):
+    text = str(text)
+    return (
+        text.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("Ã¢â‚¬Å“", '"')
+        .replace("Ã¢â‚¬Â", '"')
+        .replace("Ã¢â‚¬Ëœ", "'")
+        .replace("Ã¢â‚¬â„¢", "'")
+    )
+
+
+def clean_speaker_labels(text):
+    text = re.sub(r"(^|\s)[A-D]:\s*", " ", str(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_quoted_english(text):
+    matches = re.findall(r'"([^"]+)"', normalize_quotes(text))
+    return " / ".join(match.strip() for match in matches if match.strip())
+
+
+def remove_quoted_text(text):
+    text = re.sub(r'"[^"]+"', " ", normalize_quotes(text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_into_choice_chunks(text, count=4):
+    words = clean(text).split()
+
+    if len(words) >= count:
+        base_size, remainder = divmod(len(words), count)
+        chunks = []
+        start = 0
+        for index in range(count):
+            size = base_size + (1 if index < remainder else 0)
+            chunks.append(" ".join(words[start:start + size]))
+            start += size
+    else:
+        chars = list(re.sub(r"\s+", "", clean(text)))
+        if len(chars) >= count:
+            base_size, remainder = divmod(len(chars), count)
+            chunks = []
+            start = 0
+            for index in range(count):
+                size = base_size + (1 if index < remainder else 0)
+                chunks.append("".join(chars[start:start + size]))
+                start += size
+        else:
+            chunks = chars[:]
+
+    while len(chunks) < count:
+        chunks.append("")
+
+    return chunks[:count]
+
+
+def make_choices(text):
+    chunks = [chunk for chunk in split_into_choice_chunks(text, 4) if chunk]
+    random.shuffle(chunks)
+
+    while len(chunks) < 4:
+        chunks.append("")
+
+    return " ".join(f"{chr(65 + index)}) {chunk}".strip() for index, chunk in enumerate(chunks)).strip()
+
+
+def looks_like_audio(text):
+    value = str(text).strip().lower()
+    return value.startswith("[sound:") or value.endswith((".mp3", ".m4a", ".wav", ".ogg"))
+
+
+def extract_level_tag(type_value):
+    text = str(type_value).strip()
+    language_match = re.match(r"\s*([^-]+?)\s*-\s*", text)
+    level_match = re.search(r"\bL\s*([0-9]+)\b", text, flags=re.IGNORECASE)
+
+    if not language_match or not level_match:
+        return ""
+
+    language = re.sub(r"[^a-z0-9]+", "", language_match.group(1).lower())
+    level_number = level_match.group(1)
+
+    if not language or not level_number:
+        return ""
+
+    return f"{language}pod101level{level_number}"
+
+
+def is_header_row(row):
+    normalized = [str(cell).strip().lower() for cell in row[:6]]
+    return (
+        len(normalized) >= 4
+        and normalized[0] == "type"
+        and normalized[1] == "front"
+        and normalized[2] == "back"
+        and "audio" in normalized
+    )
+
+
+def ensure_output_columns(row, header=False):
+    row = ["" if value is None else str(value) for value in row]
+
+    while len(row) < 4:
+        row.append("")
+
+    if len(row) == 4:
+        row.insert(CHOICES_COL, "Choices" if header else "")
+
+    while len(row) <= TAGS_COL:
+        row.append("")
+
+    if looks_like_audio(row[BACK_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[BACK_COL]
+        row[BACK_COL] = ""
+
+    if looks_like_audio(row[CHOICES_COL]) and not looks_like_audio(row[AUDIO_COL]):
+        row[AUDIO_COL] = row[CHOICES_COL]
+        row[CHOICES_COL] = ""
+
+    if header:
+        row[TYPE_COL] = row[TYPE_COL] or "Type"
+        row[FRONT_COL] = "Front"
+        row[BACK_COL] = "Back"
+        row[CHOICES_COL] = "Choices"
+        row[AUDIO_COL] = "Audio"
+        row[TAGS_COL] = "Tags"
+
+    return row
+
+
+def clean_csv_row(row):
+    row = ensure_output_columns(row)
+
+    front = clean(row[FRONT_COL])
+    back = clean(row[BACK_COL])
+    choices = clean(row[CHOICES_COL])
+
+    if front:
+        front = clean_speaker_labels(normalize_quotes(front))
+        extracted_english = extract_quoted_english(front)
+        cleaned_front = remove_quoted_text(front) or front
+        row[FRONT_COL] = cleaned_front
+
+        if extracted_english and not back:
+            row[BACK_COL] = extracted_english
+        elif back:
+            row[BACK_COL] = normalize_quotes(back).strip()
+
+        if not choices:
+            row[CHOICES_COL] = make_choices(cleaned_front)
+
+    if not clean(row[TAGS_COL]):
+        row[TAGS_COL] = extract_level_tag(row[TYPE_COL])
+
+    return row
+
+
+def finalize_csv(csv_path):
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.reader(handle))
+
+    processed = []
+    for index, row in enumerate(rows):
+        if not any(str(cell).strip() for cell in row):
+            processed.append(row)
+        elif index == 0 and is_header_row(row):
+            processed.append(ensure_output_columns(row, header=True))
+        else:
+            processed.append(clean_csv_row(row))
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, quoting=csv.QUOTE_MINIMAL)
+        writer.writerows(processed)
 
 
 def safe_filename(text, max_len=80):
@@ -422,6 +607,7 @@ def prompt_for_languages_from_catalog():
     print("\nLanguagePod101 auto mode")
     print("- Type one or more language names.")
     print("- Separate them with commas, or put one on each line.")
+    print("- Press ENTER on a blank line immediately to run all available languages.")
     print("- Press ENTER on a blank line when you are done.\n")
 
     print("Available languages:")
@@ -464,6 +650,10 @@ def prompt_for_languages_from_catalog():
             selected.append(dict(entry))
             selected_keys.add(entry["language_safe"])
             print(f"Added language: {entry['language']} -> {entry['site_url']}")
+
+    if not selected:
+        print("\nNo specific languages entered. Defaulting to all available languages.")
+        return [dict(entry) for entry in catalog]
 
     return selected
 
@@ -574,6 +764,9 @@ def build_jobs(raw_entries):
         language = clean(entry.get("language")) or get_language_from_domain(url)
         language_safe = safe_key(language)
         level = clean(entry.get("level")) or "unspecified"
+        if level.lower() != "unspecified" and not is_target_level_text(level):
+            print(f"Skipping non-target level for {language}: {level} / {url}")
+            continue
         level_safe = safe_key(level)
         job_slug = get_job_slug(url)
 
@@ -606,6 +799,8 @@ def group_jobs_by_language(jobs):
                 "language": job["language"],
                 "language_safe": language_safe,
                 "profile_dir": get_profile_dir(language_safe),
+                "site_url": f"{urlparse(job['url']).scheme}://{urlparse(job['url']).netloc}",
+                "domain": job["domain"],
                 "levels": set(),
                 "jobs": [],
             }
@@ -616,8 +811,18 @@ def group_jobs_by_language(jobs):
     output = []
     for bundle in grouped.values():
         bundle["levels"] = sorted(bundle["levels"])
+        bundle["jobs"] = sorted(
+            bundle["jobs"],
+            key=lambda job: (
+                get_level_number_from_text(job["level"]) or 999,
+                job["page_type"],
+                job["job_label"],
+                job["url"],
+            ),
+        )
         output.append(bundle)
 
+    output.sort(key=lambda bundle: bundle["language_safe"])
     return output
 
 
@@ -663,6 +868,7 @@ def save_csv(rows, path):
     rows = dedupe_rows(rows)
     df = pd.DataFrame(rows, columns=["Type", "Front", "Back", "Audio"])
     df.to_csv(path, index=False, encoding="utf-8-sig")
+    finalize_csv(path)
 
 
 def merge_and_save_csv(existing_path, new_rows):
@@ -805,6 +1011,10 @@ def get_level_number_from_text(text):
         return 5
 
     return None
+
+
+def is_target_level_text(text):
+    return get_level_number_from_text(text) in TARGET_LEVEL_NUMBERS
 
 
 def build_level_candidate_groups(site_url, language_safe):
@@ -1509,11 +1719,197 @@ def open_login_tabs_for_language(context, language_bundle):
         safe_goto(page, url, timeout=90000, sleep_after=3000)
         print(f"Opened login tab for {language_bundle['language']}: {domain}")
 
+def first_available_locator(page, selectors):
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            if locator.count() > 0:
+                return locator.first
+        except Exception:
+            continue
+    return None
 
-def run_language_worker(language_bundle, control_queue, start_event, result_queue):
+
+def click_first_available(page, selectors, timeout=5000):
+    locator = first_available_locator(page, selectors)
+    if not locator:
+        return False
+
+    try:
+        locator.click(timeout=timeout)
+        page.wait_for_timeout(2000)
+        return True
+    except Exception:
+        return False
+
+
+def fill_first_available(page, selectors, value):
+    locator = first_available_locator(page, selectors)
+    if not locator:
+        return False
+
+    try:
+        locator.fill("")
+        locator.fill(value)
+        return True
+    except Exception:
+        return False
+
+
+def page_has_login_form(page):
+    email_selectors = [
+        "input[type='email']",
+        "input[name*='email' i]",
+        "input[id*='email' i]",
+        "input[placeholder*='email' i]",
+    ]
+    password_selectors = [
+        "input[type='password']",
+        "input[name*='password' i]",
+        "input[id*='password' i]",
+        "input[placeholder*='password' i]",
+    ]
+    return bool(first_available_locator(page, email_selectors)) and bool(first_available_locator(page, password_selectors))
+
+
+def page_looks_logged_in(page):
+    positive_selectors = [
+        "a:has-text('Logout')",
+        "a:has-text('Log Out')",
+        "button:has-text('Logout')",
+        "button:has-text('Log Out')",
+        "[href*='logout']",
+        "[href*='member/logout']",
+    ]
+    return bool(first_available_locator(page, positive_selectors))
+
+
+def submit_login_form(page):
+    submit_selectors = [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button:has-text('Log In')",
+        "button:has-text('Login')",
+        "button:has-text('Sign In')",
+        "a:has-text('Log In')",
+        "a:has-text('Login')",
+        "a:has-text('Sign In')",
+    ]
+
+    if click_first_available(page, submit_selectors, timeout=8000):
+        return True
+
+    password_locator = first_available_locator(page, ["input[type='password']"])
+    if password_locator:
+        try:
+            password_locator.press("Enter")
+            page.wait_for_timeout(2000)
+            return True
+        except Exception:
+            return False
+
+    return False
+
+
+def ensure_logged_in(page, language_bundle):
+    site_url = language_bundle["site_url"].rstrip("/")
+    login_urls = [
+        f"{site_url}/login",
+        f"{site_url}/member/login",
+        f"{site_url}/welcome",
+        site_url,
+    ]
+    login_trigger_selectors = [
+        "a:has-text('Log In')",
+        "a:has-text('Login')",
+        "a:has-text('Sign In')",
+        "button:has-text('Log In')",
+        "button:has-text('Login')",
+        "button:has-text('Sign In')",
+        "[href*='login']",
+        "[href*='signin']",
+    ]
+    email_selectors = [
+        "input[type='email']",
+        "input[name*='email' i]",
+        "input[id*='email' i]",
+        "input[placeholder*='email' i]",
+    ]
+    password_selectors = [
+        "input[type='password']",
+        "input[name*='password' i]",
+        "input[id*='password' i]",
+        "input[placeholder*='password' i]",
+    ]
+
+    page.goto(site_url, wait_until="domcontentloaded", timeout=90000)
+    page.wait_for_timeout(2500)
+
+    if page_looks_logged_in(page):
+        print(f"Already logged in for {language_bundle['language']}.")
+        return
+
+    login_form_found = page_has_login_form(page)
+    if not login_form_found:
+        click_first_available(page, login_trigger_selectors, timeout=8000)
+        login_form_found = page_has_login_form(page)
+
+    if not login_form_found:
+        for login_url in login_urls:
+            if not safe_goto(page, login_url, timeout=90000, sleep_after=2500):
+                continue
+            if page_has_login_form(page):
+                login_form_found = True
+                break
+
+    if not login_form_found:
+        raise RuntimeError(f"Could not find login form for {language_bundle['language']} at {site_url}")
+
+    if not fill_first_available(page, email_selectors, LOGIN_EMAIL):
+        raise RuntimeError(f"Could not fill email for {language_bundle['language']}")
+
+    if not fill_first_available(page, password_selectors, LOGIN_PASSWORD):
+        raise RuntimeError(f"Could not fill password for {language_bundle['language']}")
+
+    if not submit_login_form(page):
+        raise RuntimeError(f"Could not submit login form for {language_bundle['language']}")
+
+    page.wait_for_timeout(5000)
+    safe_goto(page, f"{site_url}/welcome", timeout=90000, sleep_after=3000)
+
+    if page_has_login_form(page) and not page_looks_logged_in(page):
+        raise RuntimeError(f"Login appears to have failed for {language_bundle['language']}")
+
+    print(f"Login completed for {language_bundle['language']}.")
+
+
+def prepare_language_profiles(language_bundles):
+    with sync_playwright() as playwright:
+        for index, bundle in enumerate(language_bundles, 1):
+            print("\n" + "=" * 95)
+            print(f"PREPARING LOGIN {index}/{len(language_bundles)}")
+            print(f"Language: {bundle['language']}")
+            print(f"Site:     {bundle.get('site_url', bundle.get('domain', ''))}")
+            print(f"Profile:  {bundle['profile_dir']}")
+            print("=" * 95)
+
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=bundle["profile_dir"],
+                headless=False,
+            )
+            try:
+                page = context.new_page()
+                ensure_logged_in(page, bundle)
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+
+def run_language_worker(language_bundle):
     restore_print = install_print_prefix(language_bundle["language"])
     context = None
-    login_signal_sent = False
 
     total_new_cards = 0
     total_skipped = 0
@@ -1525,19 +1921,6 @@ def run_language_worker(language_bundle, control_queue, start_event, result_queu
                 user_data_dir=language_bundle["profile_dir"],
                 headless=False,
             )
-            open_login_tabs_for_language(context, language_bundle)
-            control_queue.put(
-                {
-                    "kind": "login_ready",
-                    "language": language_bundle["language"],
-                    "language_safe": language_bundle["language_safe"],
-                }
-            )
-            login_signal_sent = True
-
-            print("\nLogin tabs are ready in this worker.")
-            print("Waiting for the main script to continue after you finish logging in...")
-            start_event.wait()
 
             page = context.new_page()
             if language_bundle.get("auto_discovery"):
@@ -1593,37 +1976,24 @@ def run_language_worker(language_bundle, control_queue, start_event, result_queu
             print(f"Total skipped lessons: {total_skipped}")
             print("=" * 85)
 
-        result_queue.put(
-            {
-                "language": language_bundle["language"],
-                "language_safe": language_bundle["language_safe"],
-                "job_summaries": job_summaries,
-                "new_cards": total_new_cards,
-                "skipped": total_skipped,
-                "status": "ok",
-            }
-        )
+        return {
+            "language": language_bundle["language"],
+            "language_safe": language_bundle["language_safe"],
+            "job_summaries": job_summaries,
+            "new_cards": total_new_cards,
+            "skipped": total_skipped,
+            "status": "ok",
+        }
     except Exception as e:
-        if not login_signal_sent:
-            control_queue.put(
-                {
-                    "kind": "login_error",
-                    "language": language_bundle["language"],
-                    "language_safe": language_bundle["language_safe"],
-                    "error": str(e),
-                }
-            )
-        result_queue.put(
-            {
-                "language": language_bundle["language"],
-                "language_safe": language_bundle["language_safe"],
-                "job_summaries": job_summaries,
-                "new_cards": total_new_cards,
-                "skipped": total_skipped,
-                "status": "error",
-                "error": str(e),
-            }
-        )
+        return {
+            "language": language_bundle["language"],
+            "language_safe": language_bundle["language_safe"],
+            "job_summaries": job_summaries,
+            "new_cards": total_new_cards,
+            "skipped": total_skipped,
+            "status": "error",
+            "error": str(e),
+        }
     finally:
         if context:
             try:
@@ -1633,118 +2003,15 @@ def run_language_worker(language_bundle, control_queue, start_event, result_queu
         builtins.print = restore_print
 
 
-def drain_result_queue(result_queue):
+def run_languages_sequential(language_bundles):
     results = []
 
-    while True:
-        try:
-            results.append(result_queue.get_nowait())
-        except queue.Empty:
-            break
+    for bundle_index, bundle in enumerate(language_bundles, 1):
+        print("\nStarting language:")
+        print(f"- {bundle_index}/{len(language_bundles)}: {bundle['language']}")
+        results.append(run_language_worker(bundle))
 
     return results
-
-
-def run_languages_parallel(language_bundles):
-    if not language_bundles:
-        return []
-
-    ctx = multiprocessing.get_context("spawn")
-    control_queue = ctx.Queue()
-    result_queue = ctx.Queue()
-    results = []
-
-    parallel_limit = MAX_PARALLEL_LANGUAGES or len(language_bundles)
-    parallel_limit = max(1, min(parallel_limit, len(language_bundles)))
-
-    for start in range(0, len(language_bundles), parallel_limit):
-        batch = language_bundles[start : start + parallel_limit]
-        processes = []
-        start_event = ctx.Event()
-
-        print("\nStarting parallel language batch:")
-        for bundle in batch:
-            print(f"- {bundle['language']} ({len(bundle['jobs'])} jobs)")
-
-        for bundle in batch:
-            process = ctx.Process(
-                target=run_language_worker,
-                args=(bundle, control_queue, start_event, result_queue),
-            )
-            process.start()
-            processes.append((bundle, process))
-
-        login_status_by_language = {}
-
-        while len(login_status_by_language) < len(batch):
-            signal = control_queue.get()
-            language_safe = signal["language_safe"]
-
-            if language_safe in login_status_by_language:
-                continue
-
-            login_status_by_language[language_safe] = signal
-
-            if signal["kind"] == "login_ready":
-                print(f"Login window ready for {signal['language']}.")
-            else:
-                print(f"Could not prepare login window for {signal['language']}: {signal.get('error', 'Unknown error')}")
-
-        ready_languages = [
-            signal["language"]
-            for signal in login_status_by_language.values()
-            if signal["kind"] == "login_ready"
-        ]
-
-        if ready_languages:
-            print("\nThese login windows are the same ones that will do the downloading:")
-            for language in ready_languages:
-                print(f"- {language}")
-            print("Log in to them now. They will stay open and continue from the same session.")
-            input("\nPress ENTER when these language logins are done... ")
-
-        start_event.set()
-
-        for bundle, process in processes:
-            process.join()
-
-            if process.exitcode != 0:
-                results.append(
-                    {
-                        "language": bundle["language"],
-                        "language_safe": bundle["language_safe"],
-                        "job_summaries": [],
-                        "new_cards": 0,
-                        "skipped": 0,
-                        "status": "error",
-                        "error": f"Worker exited with code {process.exitcode}",
-                    }
-                )
-
-        results.extend(drain_result_queue(result_queue))
-
-    deduped_results = {}
-    for result in results:
-        deduped_results[result["language_safe"]] = result
-
-    ordered_results = []
-    for bundle in language_bundles:
-        ordered_results.append(
-            deduped_results.get(
-                bundle["language_safe"],
-                {
-                    "language": bundle["language"],
-                    "language_safe": bundle["language_safe"],
-                    "job_summaries": [],
-                    "new_cards": 0,
-                    "skipped": 0,
-                    "status": "error",
-                    "error": "No worker result returned",
-                },
-            )
-        )
-
-    return ordered_results
 
 
 def collect_all_language_rows(language_bundles):
@@ -1762,10 +2029,6 @@ def main():
     if start_mode == "auto_languages":
         selected_sites = prompt_for_languages_from_catalog()
 
-        if not selected_sites:
-            print("No languages were entered. Exiting.")
-            return
-
         language_bundles = build_auto_language_bundles(selected_sites)
 
         print("\nLanguages queued for auto-discovery:")
@@ -1779,7 +2042,7 @@ def main():
         for bundle in language_bundles:
             print("-", bundle["domain"])
 
-        print("\nLanguage workers that will run in parallel:")
+        print("\nLanguages queued to run one by one:")
         for bundle in language_bundles:
             print(
                 f"- {bundle['language']}: auto-discover levels 1 to 5, "
@@ -1811,20 +2074,22 @@ def main():
 
         language_bundles = group_jobs_by_language(jobs)
 
-        print("\nLanguage workers that will run in parallel:")
+        print("\nLanguages queued to run one by one:")
         for bundle in language_bundles:
             print(
                 f"- {bundle['language']}: {len(bundle['jobs'])} jobs, "
                 f"levels {', '.join(bundle['levels'])}, profile {bundle['profile_dir']}"
             )
 
-    print("\nParallel mode: one worker per language.")
-    print("Each language keeps its own browser profile and downloads independently.")
-    print("Each worker rests between lessons so the same site is not hit too fast.")
-    print("Login now happens inside the same browser session that will do the downloads.")
+    print("\nSequential mode: one language at a time.")
+    print("Each language keeps its own browser profile.")
+    print("The script logs into every language site first, then scrapes language by language.")
+    print("For each language, it only targets Levels 1 through 5 before moving to the next language.")
+    print("Existing lesson folders and CSVs are checked so the run can resume where it left off.")
 
     try:
-        worker_results = run_languages_parallel(language_bundles)
+        prepare_language_profiles(language_bundles)
+        worker_results = run_languages_sequential(language_bundles)
 
         grand_rows = collect_all_language_rows(language_bundles)
         grand_skipped = sum(result.get("skipped", 0) for result in worker_results)
@@ -1863,5 +2128,4 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     main()
