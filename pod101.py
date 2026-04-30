@@ -1,14 +1,10 @@
-import builtins
 import csv
 import hashlib
 import html
-import multiprocessing
 import os
-import queue
 import random
 import re
 import time
-from collections import deque
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import pandas as pd
@@ -22,8 +18,6 @@ REST_BETWEEN_LESSONS = 15
 REST_BETWEEN_JOB_STARTS = 15
 REST_BETWEEN_JOB_BATCHES = 15
 
-MAX_PARALLEL_LANGUAGES = 2
-MAX_PARALLEL_URLS_PER_LANGUAGE = 2
 MAX_AUDIO_RETRIES = 3
 JITTER_MIN_SECONDS = 1.5
 JITTER_MAX_SECONDS = 4.0
@@ -760,23 +754,18 @@ def scroll_page(page):
             page.wait_for_timeout(3000)
 
 
-def get_page_title_from_html_content(page_html):
-    soup = BeautifulSoup(page_html, "html.parser")
-
-    h1 = soup.find("h1")
-    if h1:
-        title = clean(h1.get_text(" ", strip=True))
-        if title:
-            return title
-
+def get_title(soup):
     title_tag = soup.find("title")
     if title_tag:
-        title = clean(title_tag.get_text(" ", strip=True))
-        title = re.sub(r"\s*-\s*.*101.*$", "", title)
-        if title:
-            return title
+        return clean(re.sub(r"\s*-\s*.*101.*$", "", title_tag.get_text(" ", strip=True)))
 
-    return "lesson"
+    h1 = soup.find("h1")
+    return clean(h1.get_text(" ", strip=True)) if h1 else "lesson"
+
+
+def get_page_title_from_html_content(page_html):
+    soup = BeautifulSoup(page_html, "html.parser")
+    return get_title(soup)
 
 
 def collect_lesson_links(page, base_url):
@@ -811,8 +800,6 @@ def collect_lesson_links(page, base_url):
         r"&quot;url&quot;\s*:\s*&quot;([^&]+?/lesson/[^&]+)&quot;",
         r"(\/lesson\/[^\"'<>\s]+?\?lp=\d+)",
         r"(https?://[^\"'<>\s]+?/lesson/[^\"'<>\s]+?\?lp=\d+)",
-        r"(\/lesson\/[^\"'<>\s]+)",
-        r"(https?://[^\"'<>\s]+?/lesson/[^\"'<>\s]+)",
     ]
 
     for pattern in patterns:
@@ -826,25 +813,24 @@ def download_audio(context, url, path, label):
     ensure_parent_folder(path)
 
     if os.path.exists(path) and os.path.getsize(path) > 0:
-        print(f"    Using existing audio for {label}: {abs_path(path)}")
+        print(f"    Existing audio for {label}: {os.path.basename(path)}")
         return True
 
     for attempt in range(1, MAX_AUDIO_RETRIES + 1):
         try:
-            print(f"    Downloading audio for {label}: {abs_path(path)}")
+            print(f"    Downloading audio for {label}: {os.path.basename(path)}")
             response = context.request.get(url)
 
             if response.status == 200:
                 with open(path, "wb") as file_handle:
                     file_handle.write(response.body())
 
-                print(f"    Saved audio for {label}: {abs_path(path)}")
+                print(f"    Saved audio for {label}: {os.path.basename(path)}")
                 random_rest(0.4, 1.2)
                 return True
 
-            print("    Failed audio request:")
-            print("    ", url)
-            print("    ", "HTTP", response.status)
+            print(f"    Failed audio request for {label}: HTTP {response.status}")
+            print(f"    URL: {url}")
             if attempt < MAX_AUDIO_RETRIES:
                 random_rest(3.0, 8.0, "    Retrying audio.")
                 continue
@@ -852,9 +838,8 @@ def download_audio(context, url, path, label):
             return False
 
         except Exception as e:
-            print("    Audio download error:")
-            print("    ", url)
-            print("    ", e)
+            print(f"    Audio download error for {label}: {e}")
+            print(f"    URL: {url}")
             if attempt < MAX_AUDIO_RETRIES:
                 random_rest(3.0, 8.0, "    Retrying audio.")
                 continue
@@ -865,7 +850,7 @@ def extract_dialogue_items(soup, lesson_url, seen_audio):
     items = []
 
     for tr in soup.select("tr"):
-        btn = tr.select_one(".js-lsn3-play-dialogue[data-src], .js-lsn3-play-dialogue")
+        btn = tr.select_one(".js-lsn3-play-dialogue[data-src]")
         if not btn:
             continue
 
@@ -925,7 +910,7 @@ def extract_vocab_items(soup, lesson_url, seen_audio):
             "[class*='definition'], "
             "[class*='meaning']"
         )
-        btn = tr.select_one(".js-lsn3-play-vocabulary[data-src], .js-lsn3-play-vocabulary")
+        btn = tr.select_one(".js-lsn3-play-vocabulary[data-src]")
 
         if not word_tag or not btn:
             continue
@@ -967,7 +952,7 @@ def extract_sentence_items(soup, lesson_url, seen_audio):
     )
 
     for block in example_blocks:
-        btn = block.select_one(".js-lsn3-play-vocabulary[data-src], .js-lsn3-play-vocabulary")
+        btn = block.select_one(".js-lsn3-play-vocabulary[data-src]")
         if not btn:
             continue
 
@@ -1039,10 +1024,16 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
         print("Could not open lesson. Skipping.")
         return []
 
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except PlaywrightTimeoutError:
+        pass
+
+    page.wait_for_timeout(4000)
     page_html = get_page_html(page)
     soup = BeautifulSoup(page_html, "html.parser")
 
-    title = get_page_title_from_html_content(page_html)
+    title = get_title(soup)
     lesson_folder = get_lesson_folder(root_dir, lesson_number, title, lesson_id, job["url_type"])
     ensure_folder(lesson_folder)
 
@@ -1288,18 +1279,6 @@ def process_job(context, page, job, job_index, total_jobs):
     return process_level_job(context, page, job, job_index, total_jobs)
 
 
-def install_print_prefix(prefix):
-    original_print = builtins.print
-
-    def prefixed_print(*args, **kwargs):
-        if args:
-            return original_print(f"[{prefix}]", *args, **kwargs)
-        return original_print(*args, **kwargs)
-
-    builtins.print = prefixed_print
-    return original_print
-
-
 def open_login_tabs_for_language(context, language_bundle):
     print(f"\nOpening login tabs for {language_bundle['language']}...")
 
@@ -1311,18 +1290,6 @@ def open_login_tabs_for_language(context, language_bundle):
         page = context.new_page()
         safe_goto(page, url, timeout=90000, sleep_after=3000)
         print(f"Opened login tab for {language_bundle['language']}: {domain}")
-
-
-def get_language_storage_state_path(language_bundle):
-    profile_dir = abs_path(language_bundle["profile_dir"])
-    ensure_folder(profile_dir)
-    return os.path.join(profile_dir, f"{language_bundle['language_safe']}_storage_state.json")
-
-
-def save_language_storage_state(context, language_bundle):
-    storage_state_path = get_language_storage_state_path(language_bundle)
-    context.storage_state(path=storage_state_path)
-    return storage_state_path
 
 
 def prepare_language_profiles(language_bundles):
@@ -1341,12 +1308,8 @@ def prepare_language_profiles(language_bundles):
             print("\nLogin these language/site windows before scraping starts:")
             for bundle, _ in sessions:
                 print(f"- {bundle['language']}")
-            print("After you finish logging in, the script will save those sessions and continue automatically.")
+            print("After you finish logging in, the script will reuse those same profile folders for scraping.")
             input("\nPress ENTER when all login windows are ready... ")
-
-            for bundle, context in sessions:
-                storage_state_path = save_language_storage_state(context, bundle)
-                print(f"Saved login state for {bundle['language']}: {storage_state_path}")
 
         for _, context in sessions:
             try:
@@ -1393,10 +1356,9 @@ def merge_level_masters_for_language(language_bundle):
     return master_paths
 
 
-def run_jobs_sequential_for_language(language_bundle, storage_state_path):
+def run_jobs_sequential_for_language(language_bundle):
     jobs = language_bundle["jobs"]
     total_jobs = len(jobs)
-    context = None
 
     if not jobs:
         return [], 0, 0, []
@@ -1407,10 +1369,11 @@ def run_jobs_sequential_for_language(language_bundle, storage_state_path):
     job_errors = []
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
-
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=language_bundle["profile_dir"],
+            headless=False,
+        )
         try:
-            context = browser.new_context(storage_state=storage_state_path)
             page = context.new_page()
 
             for job_index, job in enumerate(jobs, 1):
@@ -1478,32 +1441,26 @@ def run_jobs_sequential_for_language(language_bundle, storage_state_path):
                 context.close()
             except Exception:
                 pass
-            try:
-                browser.close()
-            except Exception:
-                pass
 
     return ordered_results, total_new_cards, total_skipped, job_errors
 
 
 def run_language_worker(language_bundle):
-    restore_print = install_print_prefix(language_bundle["language"])
     total_new_cards = 0
     total_skipped = 0
     job_summaries = []
     job_errors = []
     level_master_paths = []
-    storage_state_path = get_language_storage_state_path(language_bundle)
 
     try:
-        if not os.path.exists(storage_state_path):
-            raise RuntimeError(
-                f"Missing saved login state for {language_bundle['language']}: {storage_state_path}"
-            )
+        print("\n" + "#" * 95)
+        print(f"STARTING LANGUAGE: {language_bundle['language']}")
+        print(f"Profile: {abs_path(language_bundle['profile_dir'])}")
+        print(f"Jobs in this language: {len(language_bundle['jobs'])}")
+        print("#" * 95)
 
         ordered_job_results, total_new_cards, total_skipped, job_errors = run_jobs_sequential_for_language(
-            language_bundle,
-            storage_state_path,
+            language_bundle
         )
         job_summaries = [
             result["job_summary"]
@@ -1517,10 +1474,6 @@ def run_language_worker(language_bundle):
         print("=" * 85)
         print(f"Language:              {language_bundle['language']}")
         print(f"Jobs completed:        {len(language_bundle['jobs'])}")
-        print(
-            f"Parallel URL workers:  "
-            f"{get_parallel_limit(MAX_PARALLEL_URLS_PER_LANGUAGE, len(language_bundle['jobs']))}"
-        )
         print(f"Total new cards:       {total_new_cards}")
         print(f"Total skipped lessons: {total_skipped}")
         print(f"Level master CSVs:     {len(level_master_paths)}")
@@ -1550,13 +1503,6 @@ def run_language_worker(language_bundle):
             "status": "error",
             "error": str(e),
         }
-    finally:
-        if storage_state_path and os.path.exists(storage_state_path):
-            try:
-                os.remove(storage_state_path)
-            except Exception:
-                pass
-        builtins.print = restore_print
 
 
 def run_languages_sequential(language_bundles):
@@ -1674,5 +1620,4 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     main()

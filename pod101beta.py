@@ -396,6 +396,31 @@ def get_audio_url(tag, base_url):
     return expand_url(raw, base_url) if raw else ""
 
 
+def collect_lesson_debug_counts(soup):
+    return {
+        "dialogue_buttons": len(soup.select(".js-lsn3-play-dialogue")),
+        "vocab_buttons": len(soup.select(".js-lsn3-play-vocabulary")),
+        "dialogue_name_cells": len(soup.select(".lsn3-lesson-dialogue__td--name")),
+        "dialogue_text_cells": len(soup.select(".lsn3-lesson-dialogue__td--text")),
+        "vocab_lang_cells": len(
+            soup.select(
+                ".lsn3-lesson-vocabulary__lang, "
+                ".lesson-vocabulary__lang, "
+                "[class*='vocabulary__lang']"
+            )
+        ),
+        "sample_blocks": len(
+            soup.select(
+                ".lsn3-lesson-vocabulary__sample, "
+                ".lesson-vocabulary__sample, "
+                "[class*='vocabulary__sample'], "
+                "[class*='sample-sentence'], "
+                "[class*='example']"
+            )
+        ),
+    }
+
+
 def safe_goto(page, url, timeout=90000, sleep_after=3000):
     for attempt in range(1, 4):
         try:
@@ -1194,18 +1219,25 @@ def download_audio(context, url, path, label):
 
 def extract_dialogue_items(soup, lesson_url, seen_audio):
     items = []
+    raw_rows = 0
+    duplicate_audio = 0
+    missing_audio = 0
+    empty_front = 0
 
     for tr in soup.select("tr"):
-        btn = tr.select_one(".js-lsn3-play-dialogue[data-src], .js-lsn3-play-dialogue")
+        btn = tr.select_one(".js-lsn3-play-dialogue[data-src]")
         if not btn:
             continue
+        raw_rows += 1
 
         audio_url = get_audio_url(btn, lesson_url)
         if not is_audio(audio_url):
+            missing_audio += 1
             continue
 
         audio_key = canonical_url_key(audio_url)
         if audio_key in seen_audio:
+            duplicate_audio += 1
             continue
 
         speaker_tag = tr.select_one(".lsn3-lesson-dialogue__td--name")
@@ -1217,6 +1249,7 @@ def extract_dialogue_items(soup, lesson_url, seen_audio):
 
         front = f"{speaker} {text}" if speaker and text and not text.startswith(speaker) else text
         if not front:
+            empty_front += 1
             continue
 
         seen_audio.add(audio_key)
@@ -1228,33 +1261,55 @@ def extract_dialogue_items(soup, lesson_url, seen_audio):
             }
         )
 
+    print(f"  Dialogue scan: rows with play buttons={raw_rows}, accepted={len(items)}")
+    if missing_audio:
+        print(f"  Dialogue scan: skipped missing or non-audio URLs={missing_audio}")
+    if duplicate_audio:
+        print(f"  Dialogue scan: skipped duplicate audio URLs={duplicate_audio}")
+    if empty_front:
+        print(f"  Dialogue scan: skipped empty dialogue text={empty_front}")
     return items
 
 
 def extract_vocab_items(soup, lesson_url, seen_audio):
     items = []
+    raw_rows = 0
+    skipped_samples = 0
+    missing_audio = 0
+    duplicate_audio = 0
+    empty_word = 0
 
-    for tr in soup.select("tr"):
+    vocab_rows = soup.select(
+        "tr:has(.lsn3-lesson-vocabulary__lang), "
+        "tr:has(.lesson-vocabulary__lang), "
+        "tr:has([class*='vocabulary__lang'])"
+    )
+
+    for tr in vocab_rows:
         word_tag = tr.select_one(
             ".lsn3-lesson-vocabulary__lang, "
             ".lesson-vocabulary__lang, "
             "[class*='vocabulary__lang']"
         )
-        btn = tr.select_one(".js-lsn3-play-vocabulary[data-src], .js-lsn3-play-vocabulary")
+        btn = tr.select_one(".js-lsn3-play-vocabulary[data-src]")
 
         if not word_tag or not btn:
             continue
+        raw_rows += 1
 
         classes = " ".join(tr.get("class", []))
         if "sample" in classes.lower() or "example" in classes.lower():
+            skipped_samples += 1
             continue
 
         audio_url = get_audio_url(btn, lesson_url)
         if not is_audio(audio_url):
+            missing_audio += 1
             continue
 
         audio_key = canonical_url_key(audio_url)
         if audio_key in seen_audio:
+            duplicate_audio += 1
             continue
 
         meaning_tag = tr.select_one(
@@ -1268,6 +1323,7 @@ def extract_vocab_items(soup, lesson_url, seen_audio):
         meaning = clean(meaning_tag.get_text(" ", strip=True)) if meaning_tag else clean(btn.get("data-english-text"))
 
         if not word:
+            empty_word += 1
             continue
 
         seen_audio.add(audio_key)
@@ -1280,6 +1336,15 @@ def extract_vocab_items(soup, lesson_url, seen_audio):
             }
         )
 
+    print(f"  Vocab scan: rows with play buttons={raw_rows}, accepted={len(items)}")
+    if skipped_samples:
+        print(f"  Vocab scan: skipped sample/example rows={skipped_samples}")
+    if missing_audio:
+        print(f"  Vocab scan: skipped missing or non-audio URLs={missing_audio}")
+    if duplicate_audio:
+        print(f"  Vocab scan: skipped duplicate audio URLs={duplicate_audio}")
+    if empty_word:
+        print(f"  Vocab scan: skipped empty vocab text={empty_word}")
     return items
 
 
@@ -1294,21 +1359,30 @@ def extract_sentence_items(soup, lesson_url, seen_audio):
         "[class*='example']"
     )
 
+    raw_blocks = 0
+    missing_audio = 0
+    duplicate_audio = 0
+    empty_text = 0
+
     for block in example_blocks:
-        btn = block.select_one(".js-lsn3-play-vocabulary[data-src], .js-lsn3-play-vocabulary")
+        btn = block.select_one(".js-lsn3-play-vocabulary[data-src]")
         if not btn:
             continue
+        raw_blocks += 1
 
         audio_url = get_audio_url(btn, lesson_url)
         if not is_audio(audio_url):
+            missing_audio += 1
             continue
 
         audio_key = canonical_url_key(audio_url)
         if audio_key in seen_audio:
+            duplicate_audio += 1
             continue
 
         text = clean(btn.get("data-text")) or clean(block.get_text(" ", strip=True))
         if not text:
+            empty_text += 1
             continue
 
         seen_audio.add(audio_key)
@@ -1320,6 +1394,13 @@ def extract_sentence_items(soup, lesson_url, seen_audio):
             }
         )
 
+    print(f"  Sentence scan: sample blocks with play buttons={raw_blocks}, accepted={len(items)}")
+    if missing_audio:
+        print(f"  Sentence scan: skipped missing or non-audio URLs={missing_audio}")
+    if duplicate_audio:
+        print(f"  Sentence scan: skipped duplicate audio URLs={duplicate_audio}")
+    if empty_text:
+        print(f"  Sentence scan: skipped empty sentence text={empty_text}")
     return items
 
 
@@ -1338,6 +1419,16 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
     if not safe_goto(page, lesson_url):
         print("Could not open lesson. Skipping.")
         return []
+
+    print("\nWaiting for lesson page to finish loading...")
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+        print("Lesson page reached network idle.")
+    except PlaywrightTimeoutError:
+        print("Lesson page did not reach network idle in time. Continuing with current HTML.")
+
+    page.wait_for_timeout(4000)
+    print("Finished lesson settle wait.")
 
     page_html = page.content()
     soup = BeautifulSoup(page_html, "html.parser")
@@ -1359,9 +1450,24 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
     seen_audio = set()
     audio_ready_count = 0
     lesson_slug = safe_filename(title, max_len=50).lower()
+    debug_counts = collect_lesson_debug_counts(soup)
 
+    print("\nRAW PAGE COUNTS")
+    print("-" * 70)
+    print(f"Page title seen by browser: {clean(page.title())}")
+    print(f"Dialogue play buttons:      {debug_counts['dialogue_buttons']}")
+    print(f"Dialogue name cells:        {debug_counts['dialogue_name_cells']}")
+    print(f"Dialogue text cells:        {debug_counts['dialogue_text_cells']}")
+    print(f"Vocab play buttons:         {debug_counts['vocab_buttons']}")
+    print(f"Vocab language cells:       {debug_counts['vocab_lang_cells']}")
+    print(f"Sample/example blocks:      {debug_counts['sample_blocks']}")
+    print("-" * 70)
+
+    print("\nScanning dialogue rows...")
     dialogue_items = extract_dialogue_items(soup, lesson_url, seen_audio)
+    print("Scanning vocabulary rows...")
     vocab_items = extract_vocab_items(soup, lesson_url, seen_audio)
+    print("Scanning sentence/example blocks...")
     sentence_items = extract_sentence_items(soup, lesson_url, seen_audio)
 
     print("\nLESSON CONTENT FOUND")
@@ -1382,6 +1488,7 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
         path = os.path.join(lesson_folder, filename)
 
         print(f"  [Dialogue {index:02d}/{len(dialogue_items)}] {preview(item['front'])}")
+        print(f"    Audio URL: {item['audio_url']}")
         if download_audio(context, item["audio_url"], path, f"dialogue {index:02d}"):
             audio_ready_count += 1
             dialogue_card_count += 1
@@ -1406,6 +1513,7 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
         path = os.path.join(lesson_folder, filename)
 
         print(f"  [Vocab {index:02d}/{len(vocab_items)}] {preview(item['front'])}")
+        print(f"    Audio URL: {item['audio_url']}")
         if download_audio(context, item["audio_url"], path, f"vocab {index:02d}"):
             audio_ready_count += 1
             vocab_card_count += 1
@@ -1430,6 +1538,7 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
         path = os.path.join(lesson_folder, filename)
 
         print(f"  [Sentence {index:02d}/{len(sentence_items)}] {preview(item['front'])}")
+        print(f"    Audio URL: {item['audio_url']}")
         if download_audio(context, item["audio_url"], path, f"sentence {index:02d}"):
             audio_ready_count += 1
             sentence_card_count += 1
@@ -1449,7 +1558,9 @@ def scrape_lesson(context, page, lesson_url, lesson_number, job, root_dir):
     )
     csv_filename = safe_filename(csv_filename.replace(".csv", ""), max_len=FILE_NAME_MAX) + ".csv"
     csv_path = os.path.join(lesson_folder, csv_filename)
+    print("\nWriting lesson CSV...")
     save_csv(rows, csv_path)
+    print("Finished writing lesson CSV and running cleanup columns.")
 
     print("\nLESSON SUMMARY")
     print("-" * 75)

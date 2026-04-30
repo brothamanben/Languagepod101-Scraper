@@ -190,7 +190,7 @@ def ensure_output_columns(row, header=False):
         row[BACK_COL] = "Back"
         row[CHOICES_COL] = row[CHOICES_COL] or "Choices"
         row[AUDIO_COL] = "Audio"
-        row[LEVEL_TAG_COL] = row[LEVEL_TAG_COL] or "LevelTag"
+        row[LEVEL_TAG_COL] = row[LEVEL_TAG_COL] or "Tags"
 
     return row
 

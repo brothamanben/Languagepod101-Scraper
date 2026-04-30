@@ -578,9 +578,11 @@ def process_level(context, page, job, job_index, total_jobs):
     print("Profile:", BASE_PROFILE_DIR)
     print("#" * 80)
 
+    print("\nStep 1/3: Opening the level page...")
     page.goto(level_url, wait_until="networkidle", timeout=90000)
     page.wait_for_timeout(5000)
 
+    print("Step 2/3: Collecting lesson links from the level page...")
     lesson_links = collect_lesson_links(page, level_url)
 
     if not lesson_links:
@@ -595,6 +597,7 @@ def process_level(context, page, job, job_index, total_jobs):
     all_rows = []
     skipped_count = 0
 
+    print("\nStep 3/3: Downloading lessons in order...")
     for lesson_number, lesson_link in enumerate(lesson_links, 1):
         if lesson_already_done(root_dir, lesson_number):
             print(f"\nSkipping {level_name} Lesson {lesson_number:03d} because it already has an Anki CSV.")
@@ -655,6 +658,7 @@ with sync_playwright() as p:
     print("\nBrowser opened.")
     print("Log in if needed on the first page.")
     print("This same logged-in browser will be used for the full scrape.\n")
+    print("Levels will run one by one in the order you queued them.\n")
 
     page.goto(LEVEL_JOBS[0]["url"], wait_until="networkidle", timeout=90000)
 
